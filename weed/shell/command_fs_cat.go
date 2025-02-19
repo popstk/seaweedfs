@@ -2,9 +2,9 @@ package shell
 
 import (
 	"fmt"
-	"github.com/chrislusf/seaweedfs/weed/filer"
-	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
-	"github.com/chrislusf/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/filer"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 	"io"
 )
 
@@ -24,6 +24,10 @@ func (c *commandFsCat) Help() string {
 
 	fs.cat /dir/file_name
 `
+}
+
+func (c *commandFsCat) HasTag(CommandTag) bool {
+	return false
 }
 
 func (c *commandFsCat) Do(args []string, commandEnv *CommandEnv, writer io.Writer) (err error) {
@@ -55,7 +59,7 @@ func (c *commandFsCat) Do(args []string, commandEnv *CommandEnv, writer io.Write
 			return err
 		}
 
-		return filer.StreamContent(commandEnv.MasterClient, writer, respLookupEntry.Entry.Chunks, 0, int64(filer.FileSize(respLookupEntry.Entry)))
+		return filer.StreamContent(commandEnv.MasterClient, writer, respLookupEntry.Entry.GetChunks(), 0, int64(filer.FileSize(respLookupEntry.Entry)))
 
 	})
 

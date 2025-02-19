@@ -7,16 +7,18 @@ import (
 	"strings"
 	"time"
 
-	"github.com/chrislusf/seaweedfs/weed/filer"
-	"github.com/chrislusf/seaweedfs/weed/filer/abstract_sql"
-	"github.com/chrislusf/seaweedfs/weed/filer/mysql"
-	"github.com/chrislusf/seaweedfs/weed/util"
 	_ "github.com/go-sql-driver/mysql"
+	"github.com/seaweedfs/seaweedfs/weed/filer"
+	"github.com/seaweedfs/seaweedfs/weed/filer/abstract_sql"
+	"github.com/seaweedfs/seaweedfs/weed/filer/mysql"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
 const (
-	CONNECTION_URL_PATTERN = "%s:%s@tcp(%s:%d)/%s?charset=utf8"
+	CONNECTION_URL_PATTERN = "%s:%s@tcp(%s:%d)/%s?collation=utf8mb4_bin"
 )
+
+var _ filer.BucketAware = (*MysqlStore2)(nil)
 
 func init() {
 	filer.Stores = append(filer.Stores, &MysqlStore2{})
@@ -56,7 +58,7 @@ func (store *MysqlStore2) initialize(createTable, upsertQuery string, enableUpse
 	}
 	store.SqlGenerator = &mysql.SqlGenMysql{
 		CreateTableSqlTemplate: createTable,
-		DropTableSqlTemplate:   "drop table `%s`",
+		DropTableSqlTemplate:   "DROP TABLE `%s`",
 		UpsertQueryTemplate:    upsertQuery,
 	}
 
@@ -80,7 +82,7 @@ func (store *MysqlStore2) initialize(createTable, upsertQuery string, enableUpse
 	store.DB.SetConnMaxLifetime(time.Duration(maxLifetimeSeconds) * time.Second)
 
 	if err = store.DB.Ping(); err != nil {
-		return fmt.Errorf("connect to %s error:%v", sqlUrl, err)
+		return fmt.Errorf("connect to %s error:%v", adaptedSqlUrl, err)
 	}
 
 	if err = store.CreateTable(context.Background(), abstract_sql.DEFAULT_TABLE); err != nil && !strings.Contains(err.Error(), "table already exist") {

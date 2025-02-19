@@ -2,23 +2,26 @@ package topology
 
 import (
 	"fmt"
-	"github.com/chrislusf/seaweedfs/weed/glog"
-	"github.com/chrislusf/seaweedfs/weed/pb"
-	"github.com/chrislusf/seaweedfs/weed/pb/master_pb"
-	"github.com/chrislusf/seaweedfs/weed/storage"
-	"github.com/chrislusf/seaweedfs/weed/storage/needle"
-	"github.com/chrislusf/seaweedfs/weed/storage/types"
-	"github.com/chrislusf/seaweedfs/weed/util"
+	"sync/atomic"
+
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/pb"
+	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
+	"github.com/seaweedfs/seaweedfs/weed/storage"
+	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
+	"github.com/seaweedfs/seaweedfs/weed/storage/types"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
 type DataNode struct {
 	NodeImpl
-	Ip        string
-	Port      int
-	GrpcPort  int
-	PublicUrl string
-	LastSeen  int64 // unix time in seconds
-	Counter   int   // in race condition, the previous dataNode was not dead
+	Ip            string
+	Port          int
+	GrpcPort      int
+	PublicUrl     string
+	LastSeen      int64 // unix time in seconds
+	Counter       int   // in race condition, the previous dataNode was not dead
+	IsTerminating bool
 }
 
 func NewDataNode(id string) *DataNode {
@@ -53,14 +56,14 @@ func (dn *DataNode) getOrCreateDisk(diskType string) *Disk {
 	return disk
 }
 
-func (dn *DataNode) doAddOrUpdateVolume(v storage.VolumeInfo) (isNew, isChangedRO bool) {
+func (dn *DataNode) doAddOrUpdateVolume(v storage.VolumeInfo) (isNew, isChanged bool) {
 	disk := dn.getOrCreateDisk(v.DiskType)
 	return disk.AddOrUpdateVolume(v)
 }
 
 // UpdateVolumes detects new/deleted/changed volumes on a volume server
 // used in master to notify master clients of these changes.
-func (dn *DataNode) UpdateVolumes(actualVolumes []storage.VolumeInfo) (newVolumes, deletedVolumes, changeRO []storage.VolumeInfo) {
+func (dn *DataNode) UpdateVolumes(actualVolumes []storage.VolumeInfo) (newVolumes, deletedVolumes, changedVolumes []storage.VolumeInfo) {
 
 	actualVolumeMap := make(map[needle.VolumeId]storage.VolumeInfo)
 	for _, v := range actualVolumes {
@@ -77,11 +80,10 @@ func (dn *DataNode) UpdateVolumes(actualVolumes []storage.VolumeInfo) (newVolume
 		if _, ok := actualVolumeMap[vid]; !ok {
 			glog.V(0).Infoln("Deleting volume id:", vid)
 			disk := dn.getOrCreateDisk(v.DiskType)
-			delete(disk.volumes, vid)
+			disk.DeleteVolumeById(vid)
 			deletedVolumes = append(deletedVolumes, v)
 
-			deltaDiskUsages := newDiskUsages()
-			deltaDiskUsage := deltaDiskUsages.getOrCreateDisk(types.ToDiskType(v.DiskType))
+			deltaDiskUsage := &DiskUsageCounts{}
 			deltaDiskUsage.volumeCount = -1
 			if v.IsRemote() {
 				deltaDiskUsage.remoteVolumeCount = -1
@@ -89,16 +91,16 @@ func (dn *DataNode) UpdateVolumes(actualVolumes []storage.VolumeInfo) (newVolume
 			if !v.ReadOnly {
 				deltaDiskUsage.activeVolumeCount = -1
 			}
-			disk.UpAdjustDiskUsageDelta(deltaDiskUsages)
+			disk.UpAdjustDiskUsageDelta(types.ToDiskType(v.DiskType), deltaDiskUsage)
 		}
 	}
 	for _, v := range actualVolumes {
-		isNew, isChangedRO := dn.doAddOrUpdateVolume(v)
+		isNew, isChanged := dn.doAddOrUpdateVolume(v)
 		if isNew {
 			newVolumes = append(newVolumes, v)
 		}
-		if isChangedRO {
-			changeRO = append(changeRO, v)
+		if isChanged {
+			changedVolumes = append(changedVolumes, v)
 		}
 	}
 	return
@@ -110,13 +112,14 @@ func (dn *DataNode) DeltaUpdateVolumes(newVolumes, deletedVolumes []storage.Volu
 
 	for _, v := range deletedVolumes {
 		disk := dn.getOrCreateDisk(v.DiskType)
-		if _, found := disk.volumes[v.Id]; !found {
+
+		_, err := disk.GetVolumesById(v.Id)
+		if err != nil {
 			continue
 		}
-		delete(disk.volumes, v.Id)
+		disk.DeleteVolumeById(v.Id)
 
-		deltaDiskUsages := newDiskUsages()
-		deltaDiskUsage := deltaDiskUsages.getOrCreateDisk(types.ToDiskType(v.DiskType))
+		deltaDiskUsage := &DiskUsageCounts{}
 		deltaDiskUsage.volumeCount = -1
 		if v.IsRemote() {
 			deltaDiskUsage.remoteVolumeCount = -1
@@ -124,7 +127,7 @@ func (dn *DataNode) DeltaUpdateVolumes(newVolumes, deletedVolumes []storage.Volu
 		if !v.ReadOnly {
 			deltaDiskUsage.activeVolumeCount = -1
 		}
-		disk.UpAdjustDiskUsageDelta(deltaDiskUsages)
+		disk.UpAdjustDiskUsageDelta(types.ToDiskType(v.DiskType), deltaDiskUsage)
 	}
 	for _, v := range newVolumes {
 		dn.doAddOrUpdateVolume(v)
@@ -133,7 +136,6 @@ func (dn *DataNode) DeltaUpdateVolumes(newVolumes, deletedVolumes []storage.Volu
 }
 
 func (dn *DataNode) AdjustMaxVolumeCounts(maxVolumeCounts map[string]uint32) {
-	deltaDiskUsages := newDiskUsages()
 	for diskType, maxVolumeCount := range maxVolumeCounts {
 		if maxVolumeCount == 0 {
 			// the volume server may have set the max to zero
@@ -141,13 +143,14 @@ func (dn *DataNode) AdjustMaxVolumeCounts(maxVolumeCounts map[string]uint32) {
 		}
 		dt := types.ToDiskType(diskType)
 		currentDiskUsage := dn.diskUsages.getOrCreateDisk(dt)
-		if currentDiskUsage.maxVolumeCount == int64(maxVolumeCount) {
+		currentDiskUsageMaxVolumeCount := atomic.LoadInt64(&currentDiskUsage.maxVolumeCount)
+		if currentDiskUsageMaxVolumeCount == int64(maxVolumeCount) {
 			continue
 		}
 		disk := dn.getOrCreateDisk(dt.String())
-		deltaDiskUsage := deltaDiskUsages.getOrCreateDisk(dt)
-		deltaDiskUsage.maxVolumeCount = int64(maxVolumeCount) - currentDiskUsage.maxVolumeCount
-		disk.UpAdjustDiskUsageDelta(deltaDiskUsages)
+		disk.UpAdjustDiskUsageDelta(dt, &DiskUsageCounts{
+			maxVolumeCount: int64(maxVolumeCount) - currentDiskUsageMaxVolumeCount,
+		})
 	}
 }
 
@@ -167,8 +170,9 @@ func (dn *DataNode) GetVolumesById(id needle.VolumeId) (vInfo storage.VolumeInfo
 	found := false
 	for _, c := range dn.children {
 		disk := c.(*Disk)
-		vInfo, found = disk.volumes[id]
-		if found {
+		vInfo, err = disk.GetVolumesById(id)
+		if err == nil {
+			found = true
 			break
 		}
 	}
@@ -190,6 +194,13 @@ func (dn *DataNode) GetDataCenter() *DataCenter {
 	}
 	dcValue := dcNode.GetValue()
 	return dcValue.(*DataCenter)
+}
+
+func (dn *DataNode) GetDataCenterId() string {
+	if dc := dn.GetDataCenter(); dc != nil {
+		return string(dc.Id())
+	}
+	return ""
 }
 
 func (dn *DataNode) GetRack() *Rack {
@@ -217,10 +228,18 @@ func (dn *DataNode) ServerAddress() pb.ServerAddress {
 	return pb.NewServerAddress(dn.Ip, dn.Port, dn.GrpcPort)
 }
 
-func (dn *DataNode) ToMap() interface{} {
-	ret := make(map[string]interface{})
-	ret["Url"] = dn.Url()
-	ret["PublicUrl"] = dn.PublicUrl
+type DataNodeInfo struct {
+	Url       string `json:"Url"`
+	PublicUrl string `json:"PublicUrl"`
+	Volumes   int64  `json:"Volumes"`
+	EcShards  int64  `json:"EcShards"`
+	Max       int64  `json:"Max"`
+	VolumeIds string `json:"VolumeIds"`
+}
+
+func (dn *DataNode) ToInfo() (info DataNodeInfo) {
+	info.Url = dn.Url()
+	info.PublicUrl = dn.PublicUrl
 
 	// aggregated volume info
 	var volumeCount, ecShardCount, maxVolumeCount int64
@@ -236,12 +255,12 @@ func (dn *DataNode) ToMap() interface{} {
 		volumeIds += " " + d.GetVolumeIds()
 	}
 
-	ret["Volumes"] = volumeCount
-	ret["EcShards"] = ecShardCount
-	ret["Max"] = maxVolumeCount
-	ret["VolumeIds"] = volumeIds
+	info.Volumes = volumeCount
+	info.EcShards = ecShardCount
+	info.Max = maxVolumeCount
+	info.VolumeIds = volumeIds
 
-	return ret
+	return
 }
 
 func (dn *DataNode) ToDataNodeInfo() *master_pb.DataNodeInfo {

@@ -1,15 +1,16 @@
 package main
 
 import (
+	"crypto/md5"
+	"encoding/base64"
+	"fmt"
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
-	"encoding/base64"
-	"fmt"
-	"crypto/md5"
+	"net/http"
 	"strings"
 	"time"
-	"net/http"
+	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
 )
 
 // Downloads an item from an S3 Bucket in the region configured in the shared config
@@ -20,6 +21,8 @@ import (
 // For this exampl to work, the domainName is needd
 //     weed s3 -domainName=localhost
 func main() {
+	util_http.InitGlobalHttpClient()
+	
 	h := md5.New()
 	content := strings.NewReader(stringContent)
 	content.WriteTo(h)
@@ -63,6 +66,7 @@ func main() {
 		fmt.Printf("error put request: %v\n", err)
 		return
 	}
+	defer util_http.CloseResponse(resp)
 	fmt.Printf("response: %+v\n", resp)
 }
 

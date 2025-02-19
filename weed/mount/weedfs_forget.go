@@ -2,7 +2,7 @@ package mount
 
 import (
 	"context"
-	"github.com/chrislusf/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
 // Forget is called when the kernel discards entries from its
@@ -65,5 +65,5 @@ func (wfs *WFS) Forget(nodeid, nlookup uint64) {
 	wfs.inodeToPath.Forget(nodeid, nlookup, func(dir util.FullPath) {
 		wfs.metaCache.DeleteFolderChildren(context.Background(), dir)
 	})
-	wfs.fhmap.ReleaseByInode(nodeid)
+	wfs.fhMap.ReleaseByInode(nodeid)
 }

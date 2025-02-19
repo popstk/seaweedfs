@@ -4,10 +4,11 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"github.com/chrislusf/seaweedfs/weed/filer"
-	"github.com/chrislusf/seaweedfs/weed/glog"
-	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
-	"github.com/chrislusf/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/filer"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/s3api/s3bucket"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 	"strings"
 	"sync"
 )
@@ -31,6 +32,8 @@ type AbstractSqlStore struct {
 	dbs                map[string]bool
 	dbsLock            sync.Mutex
 }
+
+var _ filer.BucketAware = (*AbstractSqlStore)(nil)
 
 func (store *AbstractSqlStore) CanDropWholeBucket() bool {
 	return store.SupportBucketTable
@@ -138,6 +141,8 @@ func (store *AbstractSqlStore) getTxOrDB(ctx context.Context, fullpath util.Full
 			}
 		}
 
+	} else {
+		err = fmt.Errorf("invalid bucket name %s", bucket)
 	}
 
 	return
@@ -156,34 +161,27 @@ func (store *AbstractSqlStore) InsertEntry(ctx context.Context, entry *filer.Ent
 		return fmt.Errorf("encode %s: %s", entry.FullPath, err)
 	}
 
-	if len(entry.Chunks) > 50 {
+	if len(entry.GetChunks()) > filer.CountEntryChunksForGzip {
 		meta = util.MaybeGzipData(meta)
 	}
-
+	sqlInsert := "insert"
 	res, err := db.ExecContext(ctx, store.GetSqlInsert(bucket), util.HashStringToLong(dir), name, dir, meta)
-	if err == nil {
-		return
+	if err != nil && strings.Contains(strings.ToLower(err.Error()), "duplicate entry") {
+		// now the insert failed possibly due to duplication constraints
+		sqlInsert = "falls back to update"
+		glog.V(1).Infof("insert %s %s: %v", entry.FullPath, sqlInsert, err)
+		res, err = db.ExecContext(ctx, store.GetSqlUpdate(bucket), meta, util.HashStringToLong(dir), name, dir)
 	}
-
-	if !strings.Contains(strings.ToLower(err.Error()), "duplicate") {
-		// return fmt.Errorf("insert: %s", err)
-		// skip this since the error can be in a different language
-	}
-
-	// now the insert failed possibly due to duplication constraints
-	glog.V(1).Infof("insert %s falls back to update: %v", entry.FullPath, err)
-
-	res, err = db.ExecContext(ctx, store.GetSqlUpdate(bucket), meta, util.HashStringToLong(dir), name, dir)
 	if err != nil {
-		return fmt.Errorf("upsert %s: %s", entry.FullPath, err)
+		return fmt.Errorf("%s %s: %s", sqlInsert, entry.FullPath, err)
 	}
 
 	_, err = res.RowsAffected()
 	if err != nil {
-		return fmt.Errorf("upsert %s but no rows affected: %s", entry.FullPath, err)
+		return fmt.Errorf("%s %s but no rows affected: %s", sqlInsert, entry.FullPath, err)
 	}
-	return nil
 
+	return nil
 }
 
 func (store *AbstractSqlStore) UpdateEntry(ctx context.Context, entry *filer.Entry) (err error) {
@@ -345,6 +343,9 @@ func (store *AbstractSqlStore) Shutdown() {
 }
 
 func isValidBucket(bucket string) bool {
+	if s3bucket.VerifyS3BucketName(bucket) != nil {
+		return false
+	}
 	return bucket != DEFAULT_TABLE && bucket != ""
 }
 

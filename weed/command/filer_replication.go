@@ -4,11 +4,11 @@ import (
 	"context"
 	"strings"
 
-	"github.com/chrislusf/seaweedfs/weed/glog"
-	"github.com/chrislusf/seaweedfs/weed/replication"
-	"github.com/chrislusf/seaweedfs/weed/replication/sink"
-	"github.com/chrislusf/seaweedfs/weed/replication/sub"
-	"github.com/chrislusf/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/replication"
+	"github.com/seaweedfs/seaweedfs/weed/replication/sink"
+	"github.com/seaweedfs/seaweedfs/weed/replication/sub"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
 func init() {
@@ -30,7 +30,7 @@ var cmdFilerReplicate = &Command{
 
 func runFilerReplicate(cmd *Command, args []string) bool {
 
-	util.LoadConfiguration("security", false)
+	util.LoadSecurityConfiguration()
 	util.LoadConfiguration("replication", true)
 	util.LoadConfiguration("notification", true)
 	config := util.GetViper()
@@ -99,7 +99,7 @@ func runFilerReplicate(cmd *Command, args []string) bool {
 		if m.OldEntry != nil && m.NewEntry == nil {
 			glog.V(1).Infof("delete: %s", key)
 		} else if m.OldEntry == nil && m.NewEntry != nil {
-			glog.V(1).Infof("   add: %s", key)
+			glog.V(1).Infof("add: %s", key)
 		} else {
 			glog.V(1).Infof("modify: %s", key)
 		}

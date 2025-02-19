@@ -3,23 +3,26 @@ package erasure_coding
 import (
 	"errors"
 	"fmt"
-	"github.com/chrislusf/seaweedfs/weed/pb"
-	"github.com/chrislusf/seaweedfs/weed/storage/volume_info"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"math"
 	"os"
-	"sort"
 	"sync"
 	"time"
 
-	"github.com/chrislusf/seaweedfs/weed/pb/master_pb"
-	"github.com/chrislusf/seaweedfs/weed/pb/volume_server_pb"
-	"github.com/chrislusf/seaweedfs/weed/storage/idx"
-	"github.com/chrislusf/seaweedfs/weed/storage/needle"
-	"github.com/chrislusf/seaweedfs/weed/storage/types"
+	"slices"
+
+	"github.com/seaweedfs/seaweedfs/weed/pb"
+	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
+	"github.com/seaweedfs/seaweedfs/weed/pb/volume_server_pb"
+	"github.com/seaweedfs/seaweedfs/weed/storage/idx"
+	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
+	"github.com/seaweedfs/seaweedfs/weed/storage/types"
+	"github.com/seaweedfs/seaweedfs/weed/storage/volume_info"
 )
 
 var (
-	NotFoundError = errors.New("needle not found")
+	NotFoundError             = errors.New("needle not found")
+	destroyDelaySeconds int64 = 0
 )
 
 type EcVolume struct {
@@ -38,6 +41,8 @@ type EcVolume struct {
 	ecjFile                   *os.File
 	ecjFileAccessLock         sync.Mutex
 	diskType                  types.DiskType
+	datFileSize               int64
+	ExpireAtSec               uint64 //ec volume destroy time, calculated from the ec volume was created
 }
 
 func NewEcVolume(diskType types.DiskType, dir string, dirIdx string, collection string, vid needle.VolumeId) (ev *EcVolume, err error) {
@@ -52,6 +57,7 @@ func NewEcVolume(diskType types.DiskType, dir string, dirIdx string, collection 
 	}
 	ecxFi, statErr := ev.ecxFile.Stat()
 	if statErr != nil {
+		_ = ev.ecxFile.Close()
 		return nil, fmt.Errorf("can not stat ec volume index %s.ecx: %v", indexBaseFileName, statErr)
 	}
 	ev.ecxFileSize = ecxFi.Size()
@@ -66,7 +72,10 @@ func NewEcVolume(diskType types.DiskType, dir string, dirIdx string, collection 
 	ev.Version = needle.Version3
 	if volumeInfo, _, found, _ := volume_info.MaybeLoadVolumeInfo(dataBaseFileName + ".vif"); found {
 		ev.Version = needle.Version(volumeInfo.Version)
+		ev.datFileSize = volumeInfo.DatFileSize
+		ev.ExpireAtSec = volumeInfo.ExpireAtSec
 	} else {
+		glog.Warningf("vif file not found,volumeId:%d, filename:%s", vid, dataBaseFileName)
 		volume_info.SaveVolumeInfo(dataBaseFileName+".vif", &volume_server_pb.VolumeInfo{Version: uint32(ev.Version)})
 	}
 
@@ -82,9 +91,11 @@ func (ev *EcVolume) AddEcVolumeShard(ecVolumeShard *EcVolumeShard) bool {
 		}
 	}
 	ev.Shards = append(ev.Shards, ecVolumeShard)
-	sort.Slice(ev.Shards, func(i, j int) bool {
-		return ev.Shards[i].VolumeId < ev.Shards[j].VolumeId ||
-			ev.Shards[i].VolumeId == ev.Shards[j].VolumeId && ev.Shards[i].ShardId < ev.Shards[j].ShardId
+	slices.SortFunc(ev.Shards, func(a, b *EcVolumeShard) int {
+		if a.VolumeId != b.VolumeId {
+			return int(a.VolumeId - b.VolumeId)
+		}
+		return int(a.ShardId - b.ShardId)
 	})
 	return true
 }
@@ -126,6 +137,7 @@ func (ev *EcVolume) Close() {
 		ev.ecjFileAccessLock.Unlock()
 	}
 	if ev.ecxFile != nil {
+		_ = ev.ecxFile.Sync()
 		_ = ev.ecxFile.Close()
 		ev.ecxFile = nil
 	}
@@ -191,9 +203,10 @@ func (ev *EcVolume) ToVolumeEcShardInformationMessage() (messages []*master_pb.V
 	for _, s := range ev.Shards {
 		if s.VolumeId != prevVolumeId {
 			m = &master_pb.VolumeEcShardInformationMessage{
-				Id:         uint32(s.VolumeId),
-				Collection: s.Collection,
-				DiskType:   string(ev.diskType),
+				Id:          uint32(s.VolumeId),
+				Collection:  s.Collection,
+				DiskType:    string(ev.diskType),
+				ExpireAtSec: ev.ExpireAtSec,
 			}
 			messages = append(messages, m)
 		}
@@ -211,10 +224,23 @@ func (ev *EcVolume) LocateEcShardNeedle(needleId types.NeedleId, version needle.
 		return types.Offset{}, 0, nil, fmt.Errorf("FindNeedleFromEcx: %v", err)
 	}
 
-	shard := ev.Shards[0]
+	intervals = ev.LocateEcShardNeedleInterval(version, offset.ToActualOffset(), types.Size(needle.GetActualSize(size, version)))
+	return
+}
 
+func (ev *EcVolume) LocateEcShardNeedleInterval(version needle.Version, offset int64, size types.Size) (intervals []Interval) {
+	shard := ev.Shards[0]
+	// Usually shard will be padded to round of ErasureCodingSmallBlockSize.
+	// So in most cases, if shardSize equals to n * ErasureCodingLargeBlockSize,
+	// the data would be in small blocks.
+	shardSize := shard.ecdFileSize - 1
+	if ev.datFileSize > 0 {
+		// To get the correct LargeBlockRowsCount
+		// use datFileSize to calculate the shardSize to match the EC encoding logic.
+		shardSize = ev.datFileSize / DataShardsCount
+	}
 	// calculate the locations in the ec shards
-	intervals = LocateData(ErasureCodingLargeBlockSize, ErasureCodingSmallBlockSize, DataShardsCount*shard.ecdFileSize, offset.ToActualOffset(), types.Size(needle.GetActualSize(size, version)))
+	intervals = LocateData(ErasureCodingLargeBlockSize, ErasureCodingSmallBlockSize, shardSize, offset, types.Size(needle.GetActualSize(size, version)))
 
 	return
 }
@@ -229,8 +255,10 @@ func SearchNeedleFromSortedIndex(ecxFile *os.File, ecxFileSize int64, needleId t
 	l, h := int64(0), ecxFileSize/types.NeedleMapEntrySize
 	for l < h {
 		m := (l + h) / 2
-		if _, err := ecxFile.ReadAt(buf, m*types.NeedleMapEntrySize); err != nil {
-			return types.Offset{}, types.TombstoneFileSize, fmt.Errorf("ecx file %d read at %d: %v", ecxFileSize, m*types.NeedleMapEntrySize, err)
+		if n, err := ecxFile.ReadAt(buf, m*types.NeedleMapEntrySize); err != nil {
+			if n != types.NeedleMapEntrySize {
+				return types.Offset{}, types.TombstoneFileSize, fmt.Errorf("ecx file %d read at %d: %v", ecxFileSize, m*types.NeedleMapEntrySize, err)
+			}
 		}
 		key, offset, size = idx.IdxFileEntry(buf)
 		if key == needleId {
@@ -248,4 +276,8 @@ func SearchNeedleFromSortedIndex(ecxFile *os.File, ecxFileSize int64, needleId t
 
 	err = NotFoundError
 	return
+}
+
+func (ev *EcVolume) IsTimeToDestroy() bool {
+	return ev.ExpireAtSec > 0 && time.Now().Unix() > (int64(ev.ExpireAtSec)+destroyDelaySeconds)
 }

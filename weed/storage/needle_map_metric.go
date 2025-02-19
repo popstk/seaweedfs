@@ -2,12 +2,13 @@ package storage
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"sync/atomic"
 
-	"github.com/chrislusf/seaweedfs/weed/storage/idx"
-	. "github.com/chrislusf/seaweedfs/weed/storage/types"
-	"github.com/tylertreat/BoomFilters"
+	"github.com/seaweedfs/seaweedfs/weed/storage/idx"
+	. "github.com/seaweedfs/seaweedfs/weed/storage/types"
+	boom "github.com/tylertreat/BoomFilters"
 )
 
 type mapMetric struct {
@@ -91,11 +92,10 @@ func (mm *mapMetric) MaybeSetMaxFileKey(key NeedleId) {
 	}
 }
 
-func newNeedleMapMetricFromIndexFile(r *os.File) (mm *mapMetric, err error) {
-	mm = &mapMetric{}
+func needleMapMetricFromIndexFile(r *os.File, mm *mapMetric) error {
 	var bf *boom.BloomFilter
 	buf := make([]byte, NeedleIdSize)
-	err = reverseWalkIndexFile(r, func(entryCount int64) {
+	err := reverseWalkIndexFile(r, func(entryCount int64) {
 		bf = boom.NewBloomFilter(uint(entryCount), 0.001)
 	}, func(key NeedleId, offset Offset, size Size) error {
 
@@ -105,8 +105,12 @@ func newNeedleMapMetricFromIndexFile(r *os.File) (mm *mapMetric, err error) {
 			mm.FileByteCounter += uint64(size)
 		}
 
+		mm.FileCounter++
 		if !bf.TestAndAdd(buf) {
-			mm.FileCounter++
+			// if !size.IsValid(), then this file is deleted already
+			if !size.IsValid() {
+				mm.DeletionCounter++
+			}
 		} else {
 			// deleted file
 			mm.DeletionCounter++
@@ -117,6 +121,12 @@ func newNeedleMapMetricFromIndexFile(r *os.File) (mm *mapMetric, err error) {
 		}
 		return nil
 	})
+	return err
+}
+
+func newNeedleMapMetricFromIndexFile(r *os.File) (mm *mapMetric, err error) {
+	mm = &mapMetric{}
+	err = needleMapMetricFromIndexFile(r, mm)
 	return
 }
 
@@ -143,8 +153,11 @@ func reverseWalkIndexFile(r *os.File, initFn func(entryCount int64), fn func(key
 	remainingCount := entryCount - nextBatchSize
 
 	for remainingCount >= 0 {
-		_, e := r.ReadAt(bytes[:NeedleMapEntrySize*nextBatchSize], NeedleMapEntrySize*remainingCount)
+		n, e := r.ReadAt(bytes[:NeedleMapEntrySize*nextBatchSize], NeedleMapEntrySize*remainingCount)
 		// glog.V(0).Infoln("file", r.Name(), "readerOffset", NeedleMapEntrySize*remainingCount, "count", count, "e", e)
+		if e == io.EOF && n == int(NeedleMapEntrySize*nextBatchSize) {
+			e = nil
+		}
 		if e != nil {
 			return e
 		}

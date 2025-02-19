@@ -13,6 +13,8 @@ grpcAddress = "localhost:18888"
 # this is not a directory on your hard drive, but on your filer.
 # i.e., all files with this "prefix" are sent to notification message queue.
 directory = "/buckets"
+# files from the directory separated by space are excluded from sending notifications
+excludeDirectories = "/buckets/tmp"
 
 [sink.local]
 enabled = false
@@ -66,6 +68,7 @@ is_incremental = false
 enabled = false
 b2_account_id = ""
 b2_master_application_key = ""
+b2_region = ""
 bucket = "mybucket"            # an existing bucket
 directory = "/"                # destination directory
 is_incremental = false

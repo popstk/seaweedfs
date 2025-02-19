@@ -1,7 +1,7 @@
 package shell
 
 import (
-	"github.com/chrislusf/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 	"io"
 )
 
@@ -21,8 +21,12 @@ func (c *commandLock) Name() string {
 func (c *commandLock) Help() string {
 	return `lock in order to exclusively manage the cluster
 
-	This is a blocking operation if there is alread another lock.
+	This is a blocking operation if there is already another lock.
 `
+}
+
+func (c *commandLock) HasTag(CommandTag) bool {
+	return false
 }
 
 func (c *commandLock) Do(args []string, commandEnv *CommandEnv, writer io.Writer) (err error) {
@@ -45,6 +49,10 @@ func (c *commandUnlock) Help() string {
 	return `unlock the cluster-wide lock
 
 `
+}
+
+func (c *commandUnlock) HasTag(CommandTag) bool {
+	return false
 }
 
 func (c *commandUnlock) Do(args []string, commandEnv *CommandEnv, writer io.Writer) (err error) {

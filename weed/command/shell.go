@@ -2,11 +2,11 @@ package command
 
 import (
 	"fmt"
-	"github.com/chrislusf/seaweedfs/weed/pb"
+	"github.com/seaweedfs/seaweedfs/weed/pb"
 
-	"github.com/chrislusf/seaweedfs/weed/security"
-	"github.com/chrislusf/seaweedfs/weed/shell"
-	"github.com/chrislusf/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/security"
+	"github.com/seaweedfs/seaweedfs/weed/shell"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
 var (
@@ -18,7 +18,8 @@ var (
 func init() {
 	cmdShell.Run = runShell // break init cycle
 	shellOptions.Masters = cmdShell.Flag.String("master", "", "comma-separated master servers, e.g. localhost:9333")
-	shellInitialFiler = cmdShell.Flag.String("filer", "", "filer host and port, e.g. localhost:8888")
+	shellOptions.FilerGroup = cmdShell.Flag.String("filerGroup", "", "filerGroup for the filers")
+	shellInitialFiler = cmdShell.Flag.String("filer", "", "filer host and port for initial connection, e.g. localhost:8888")
 	shellCluster = cmdShell.Flag.String("cluster", "", "cluster defined in shell.toml")
 }
 
@@ -29,32 +30,36 @@ var cmdShell = &Command{
 
 	Generate shell.toml via "weed scaffold -config=shell"
 
-  `,
+`,
 }
 
 func runShell(command *Command, args []string) bool {
 
-	util.LoadConfiguration("security", false)
+	util.LoadSecurityConfiguration()
 	shellOptions.GrpcDialOption = security.LoadClientTLS(util.GetViper(), "grpc.client")
+	shellOptions.Directory = "/"
+
+	util.LoadConfiguration("shell", false)
+	viper := util.GetViper()
+	cluster := viper.GetString("cluster.default")
+	if *shellCluster != "" {
+		cluster = *shellCluster
+	}
 
 	if *shellOptions.Masters == "" {
-		util.LoadConfiguration("shell", false)
-		v := util.GetViper()
-		cluster := v.GetString("cluster.default")
-		if *shellCluster != "" {
-			cluster = *shellCluster
-		}
 		if cluster == "" {
 			*shellOptions.Masters = "localhost:9333"
 		} else {
-			*shellOptions.Masters = v.GetString("cluster." + cluster + ".master")
-			*shellInitialFiler = v.GetString("cluster." + cluster + ".filer")
-			fmt.Printf("master: %s filer: %s\n", *shellOptions.Masters, *shellInitialFiler)
+			*shellOptions.Masters = viper.GetString("cluster." + cluster + ".master")
 		}
 	}
 
-	shellOptions.FilerAddress = pb.ServerAddress(*shellInitialFiler)
-	shellOptions.Directory = "/"
+	filerAddress := *shellInitialFiler
+	if filerAddress == "" && cluster != "" {
+		filerAddress = viper.GetString("cluster." + cluster + ".filer")
+	}
+	shellOptions.FilerAddress = pb.ServerAddress(filerAddress)
+	fmt.Printf("master: %s filer: %s\n", *shellOptions.Masters, shellOptions.FilerAddress)
 
 	shell.RunShell(shellOptions)
 

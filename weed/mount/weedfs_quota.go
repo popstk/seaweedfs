@@ -3,18 +3,20 @@ package mount
 import (
 	"context"
 	"fmt"
-	"github.com/chrislusf/seaweedfs/weed/glog"
-	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"time"
 )
 
 func (wfs *WFS) loopCheckQuota() {
 
-	if wfs.option.Quota <= 0 {
-		return
-	}
-
 	for {
+
+		time.Sleep(61 * time.Second)
+
+		if wfs.option.Quota <= 0 {
+			continue
+		}
 
 		err := wfs.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
 
@@ -47,7 +49,6 @@ func (wfs *WFS) loopCheckQuota() {
 			glog.Warningf("read quota usage: %v", err)
 		}
 
-		time.Sleep(61 * time.Second)
 	}
 
 }

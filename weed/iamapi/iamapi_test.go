@@ -2,16 +2,19 @@ package iamapi
 
 import (
 	"encoding/xml"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"regexp"
+	"testing"
+
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/iam"
-	"github.com/chrislusf/seaweedfs/weed/pb/iam_pb"
 	"github.com/gorilla/mux"
 	"github.com/jinzhu/copier"
+	"github.com/seaweedfs/seaweedfs/weed/pb/iam_pb"
 	"github.com/stretchr/testify/assert"
-	"net/http"
-	"net/http/httptest"
-	"testing"
 )
 
 var GetS3ApiConfiguration func(s3cfg *iam_pb.S3ApiConfiguration) (err error)
@@ -150,6 +153,53 @@ func TestPutUserPolicy(t *testing.T) {
 	assert.Equal(t, http.StatusOK, response.Code)
 }
 
+func TestPutUserPolicyError(t *testing.T) {
+	userName := aws.String("InvalidUser")
+	params := &iam.PutUserPolicyInput{
+		UserName:   userName,
+		PolicyName: aws.String("S3-read-only-example-bucket"),
+		PolicyDocument: aws.String(
+			`{
+				  "Version": "2012-10-17",
+				  "Statement": [
+					{
+					  "Effect": "Allow",
+					  "Action": [
+						"s3:Get*",
+						"s3:List*"
+					  ],
+					  "Resource": [
+						"arn:aws:s3:::EXAMPLE-BUCKET",
+						"arn:aws:s3:::EXAMPLE-BUCKET/*"
+					  ]
+					}
+				  ]
+			}`),
+	}
+	req, _ := iam.New(session.New()).PutUserPolicyRequest(params)
+	_ = req.Build()
+	response, err := executeRequest(req.HTTPRequest, nil)
+	assert.Equal(t, nil, err)
+	assert.Equal(t, http.StatusNotFound, response.Code)
+
+	expectedMessage := "the user with name InvalidUser cannot be found"
+	expectedCode := "NoSuchEntity"
+
+	code, message := extractErrorCodeAndMessage(response)
+
+	assert.Equal(t, expectedMessage, message)
+	assert.Equal(t, expectedCode, code)
+}
+
+func extractErrorCodeAndMessage(response *httptest.ResponseRecorder) (string, string) {
+	pattern := `<Error><Code>(.*)</Code><Message>(.*)</Message><Type>(.*)</Type></Error>`
+	re := regexp.MustCompile(pattern)
+
+	code := re.FindStringSubmatch(response.Body.String())[1]
+	message := re.FindStringSubmatch(response.Body.String())[2]
+	return code, message
+}
+
 func TestGetUserPolicy(t *testing.T) {
 	userName := aws.String("Test")
 	params := &iam.GetUserPolicyInput{UserName: userName, PolicyName: aws.String("S3-read-only-example-bucket")}
@@ -161,8 +211,20 @@ func TestGetUserPolicy(t *testing.T) {
 	assert.Equal(t, http.StatusOK, response.Code)
 }
 
-func TestDeleteUser(t *testing.T) {
+func TestUpdateUser(t *testing.T) {
 	userName := aws.String("Test")
+	newUserName := aws.String("Test-New")
+	params := &iam.UpdateUserInput{NewUserName: newUserName, UserName: userName}
+	req, _ := iam.New(session.New()).UpdateUserRequest(params)
+	_ = req.Build()
+	out := UpdateUserResponse{}
+	response, err := executeRequest(req.HTTPRequest, out)
+	assert.Equal(t, nil, err)
+	assert.Equal(t, http.StatusOK, response.Code)
+}
+
+func TestDeleteUser(t *testing.T) {
+	userName := aws.String("Test-New")
 	params := &iam.DeleteUserInput{UserName: userName}
 	req, _ := iam.New(session.New()).DeleteUserRequest(params)
 	_ = req.Build()
@@ -175,7 +237,28 @@ func TestDeleteUser(t *testing.T) {
 func executeRequest(req *http.Request, v interface{}) (*httptest.ResponseRecorder, error) {
 	rr := httptest.NewRecorder()
 	apiRouter := mux.NewRouter().SkipClean(true)
-	apiRouter.Path("/").Methods("POST").HandlerFunc(ias.DoActions)
+	apiRouter.Path("/").Methods(http.MethodPost).HandlerFunc(ias.DoActions)
 	apiRouter.ServeHTTP(rr, req)
 	return rr, xml.Unmarshal(rr.Body.Bytes(), &v)
+}
+
+func TestHandleImplicitUsername(t *testing.T) {
+	var tests = []struct {
+		r        *http.Request
+		values   url.Values
+		userName string
+	}{
+		{&http.Request{}, url.Values{}, ""},
+		{&http.Request{Header: http.Header{"Authorization": []string{"AWS4-HMAC-SHA256 Credential=197FSAQ7HHTA48X64O3A/20220420/test1/iam/aws4_request, SignedHeaders=content-type;host;x-amz-date, Signature=6757dc6b3d7534d67e17842760310e99ee695408497f6edc4fdb84770c252dc8"}}}, url.Values{}, "test1"},
+		{&http.Request{Header: http.Header{"Authorization": []string{"AWS4-HMAC-SHA256 =197FSAQ7HHTA48X64O3A/20220420/test1/iam/aws4_request, SignedHeaders=content-type;host;x-amz-date, Signature=6757dc6b3d7534d67e17842760310e99ee695408497f6edc4fdb84770c252dc8"}}}, url.Values{}, ""},
+		{&http.Request{Header: http.Header{"Authorization": []string{"AWS4-HMAC-SHA256 Credential=197FSAQ7HHTA48X64O3A/20220420/test1/iam/aws4_request SignedHeaders=content-type;host;x-amz-date Signature=6757dc6b3d7534d67e17842760310e99ee695408497f6edc4fdb84770c252dc8"}}}, url.Values{}, ""},
+		{&http.Request{Header: http.Header{"Authorization": []string{"AWS4-HMAC-SHA256 Credential=197FSAQ7HHTA48X64O3A/20220420/test1/iam, SignedHeaders=content-type;host;x-amz-date, Signature=6757dc6b3d7534d67e17842760310e99ee695408497f6edc4fdb84770c252dc8"}}}, url.Values{}, ""},
+	}
+
+	for i, test := range tests {
+		handleImplicitUsername(test.r, test.values)
+		if un := test.values.Get("UserName"); un != test.userName {
+			t.Errorf("No.%d: Got: %v, Expected: %v", i, un, test.userName)
+		}
+	}
 }

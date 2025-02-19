@@ -2,16 +2,18 @@ package weed_server
 
 import (
 	"fmt"
-	"github.com/chrislusf/seaweedfs/weed/glog"
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
-	"github.com/chrislusf/seaweedfs/weed/operation"
-	"github.com/chrislusf/seaweedfs/weed/security"
-	"github.com/chrislusf/seaweedfs/weed/stats"
-	"github.com/chrislusf/seaweedfs/weed/storage/needle"
-	"github.com/chrislusf/seaweedfs/weed/topology"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+
+	"github.com/seaweedfs/seaweedfs/weed/operation"
+	"github.com/seaweedfs/seaweedfs/weed/security"
+	"github.com/seaweedfs/seaweedfs/weed/stats"
+	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
+	"github.com/seaweedfs/seaweedfs/weed/topology"
 )
 
 func (ms *MasterServer) lookupVolumeId(vids []string, collection string) (volumeLocations map[string]operation.LookupResult) {
@@ -72,13 +74,23 @@ func (ms *MasterServer) findVolumeLocation(collection, vid string) operation.Loo
 		} else {
 			machines := ms.Topo.Lookup(collection, volumeId)
 			for _, loc := range machines {
-				locations = append(locations, operation.Location{Url: loc.Url(), PublicUrl: loc.PublicUrl})
+				locations = append(locations, operation.Location{
+					Url:        loc.Url(),
+					PublicUrl:  loc.PublicUrl,
+					DataCenter: loc.GetDataCenterId(),
+					GrpcPort:   loc.GrpcPort,
+				})
 			}
 		}
 	} else {
 		machines, getVidLocationsErr := ms.MasterClient.GetVidLocations(vid)
 		for _, loc := range machines {
-			locations = append(locations, operation.Location{Url: loc.Url, PublicUrl: loc.PublicUrl})
+			locations = append(locations, operation.Location{
+				Url:        loc.Url,
+				PublicUrl:  loc.PublicUrl,
+				DataCenter: loc.DataCenter,
+				GrpcPort:   loc.GrpcPort,
+			})
 		}
 		err = getVidLocationsErr
 	}
@@ -102,7 +114,7 @@ func (ms *MasterServer) dirAssignHandler(w http.ResponseWriter, r *http.Request)
 		requestedCount = 1
 	}
 
-	writableVolumeCount, e := strconv.Atoi(r.FormValue("writableVolumeCount"))
+	writableVolumeCount, e := strconv.ParseUint(r.FormValue("writableVolumeCount"), 10, 32)
 	if e != nil {
 		writableVolumeCount = 0
 	}
@@ -115,31 +127,53 @@ func (ms *MasterServer) dirAssignHandler(w http.ResponseWriter, r *http.Request)
 
 	vl := ms.Topo.GetVolumeLayout(option.Collection, option.ReplicaPlacement, option.Ttl, option.DiskType)
 
-	if !vl.HasGrowRequest() && vl.ShouldGrowVolumes(option) {
-		glog.V(0).Infof("dirAssign volume growth %v from %v", option.String(), r.RemoteAddr)
-		if ms.Topo.AvailableSpaceFor(option) <= 0 {
-			writeJsonQuiet(w, r, http.StatusNotFound, operation.AssignResult{Error: "No free volumes left for " + option.String()})
-			return
+	var (
+		lastErr    error
+		maxTimeout = time.Second * 10
+		startTime  = time.Now()
+	)
+
+	if !ms.Topo.DataCenterExists(option.DataCenter) {
+		writeJsonQuiet(w, r, http.StatusBadRequest, operation.AssignResult{
+			Error: fmt.Sprintf("data center %v not found in topology", option.DataCenter),
+		})
+		return
+	}
+
+	for time.Now().Sub(startTime) < maxTimeout {
+		fid, count, dnList, shouldGrow, err := ms.Topo.PickForWrite(requestedCount, option, vl)
+		if shouldGrow && !vl.HasGrowRequest() {
+			glog.V(0).Infof("dirAssign volume growth %v from %v", option.String(), r.RemoteAddr)
+			if err != nil && ms.Topo.AvailableSpaceFor(option) <= 0 {
+				err = fmt.Errorf("%s and no free volumes left for %s", err.Error(), option.String())
+			}
+			vl.AddGrowRequest()
+			ms.volumeGrowthRequestChan <- &topology.VolumeGrowRequest{
+				Option: option,
+				Count:  uint32(writableVolumeCount),
+				Reason: "http assign",
+			}
 		}
-		errCh := make(chan error, 1)
-		vl.AddGrowRequest()
-		ms.vgCh <- &topology.VolumeGrowRequest{
-			Option: option,
-			Count:  writableVolumeCount,
-			ErrCh:  errCh,
-		}
-		if err := <-errCh; err != nil {
-			writeJsonError(w, r, http.StatusInternalServerError, fmt.Errorf("cannot grow volume group! %v", err))
+		if err != nil {
+			stats.MasterPickForWriteErrorCounter.Inc()
+			lastErr = err
+			time.Sleep(200 * time.Millisecond)
+			continue
+		} else {
+			ms.maybeAddJwtAuthorization(w, fid, true)
+			dn := dnList.Head()
+			if dn == nil {
+				continue
+			}
+			writeJsonQuiet(w, r, http.StatusOK, operation.AssignResult{Fid: fid, Url: dn.Url(), PublicUrl: dn.PublicUrl, Count: count})
 			return
 		}
 	}
-	fid, count, dnList, err := ms.Topo.PickForWrite(requestedCount, option)
-	if err == nil {
-		ms.maybeAddJwtAuthorization(w, fid, true)
-		dn := dnList.Head()
-		writeJsonQuiet(w, r, http.StatusOK, operation.AssignResult{Fid: fid, Url: dn.Url(), PublicUrl: dn.PublicUrl, Count: count})
+
+	if lastErr != nil {
+		writeJsonQuiet(w, r, http.StatusNotAcceptable, operation.AssignResult{Error: lastErr.Error()})
 	} else {
-		writeJsonQuiet(w, r, http.StatusNotAcceptable, operation.AssignResult{Error: err.Error()})
+		writeJsonQuiet(w, r, http.StatusRequestTimeout, operation.AssignResult{Error: "request timeout"})
 	}
 }
 

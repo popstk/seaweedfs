@@ -7,13 +7,15 @@ import (
 	"strings"
 	"time"
 
+	"github.com/seaweedfs/seaweedfs/weed/util"
+
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/aws/aws-sdk-go/service/s3/s3iface"
 	"github.com/google/uuid"
 
-	"github.com/chrislusf/seaweedfs/weed/glog"
-	"github.com/chrislusf/seaweedfs/weed/pb/volume_server_pb"
-	"github.com/chrislusf/seaweedfs/weed/storage/backend"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/pb/volume_server_pb"
+	"github.com/seaweedfs/seaweedfs/weed/storage/backend"
 )
 
 func init() {
@@ -37,6 +39,8 @@ type S3BackendStorage struct {
 	region                string
 	bucket                string
 	endpoint              string
+	storageClass          string
+	forcePathStyle        bool
 	conn                  s3iface.S3API
 }
 
@@ -48,8 +52,13 @@ func newS3BackendStorage(configuration backend.StringProperties, configPrefix st
 	s.region = configuration.GetString(configPrefix + "region")
 	s.bucket = configuration.GetString(configPrefix + "bucket")
 	s.endpoint = configuration.GetString(configPrefix + "endpoint")
+	s.storageClass = configuration.GetString(configPrefix + "storage_class")
+	s.forcePathStyle = util.ParseBool(configuration.GetString(configPrefix+"force_path_style"), true)
+	if s.storageClass == "" {
+		s.storageClass = "STANDARD_IA"
+	}
 
-	s.conn, err = createSession(s.aws_access_key_id, s.aws_secret_access_key, s.region, s.endpoint)
+	s.conn, err = createSession(s.aws_access_key_id, s.aws_secret_access_key, s.region, s.endpoint, s.forcePathStyle)
 
 	glog.V(0).Infof("created backend storage s3.%s for region %s bucket %s", s.id, s.region, s.bucket)
 	return
@@ -62,6 +71,8 @@ func (s *S3BackendStorage) ToProperties() map[string]string {
 	m["region"] = s.region
 	m["bucket"] = s.bucket
 	m["endpoint"] = s.endpoint
+	m["storage_class"] = s.storageClass
+	m["force_path_style"] = util.BoolToString(s.forcePathStyle)
 	return m
 }
 
@@ -85,7 +96,10 @@ func (s *S3BackendStorage) CopyFile(f *os.File, fn func(progressed int64, percen
 
 	glog.V(1).Infof("copying dat file of %s to remote s3.%s as %s", f.Name(), s.id, key)
 
-	size, err = uploadToS3(s.conn, f.Name(), s.bucket, key, fn)
+	util.Retry("upload to S3", func() error {
+		size, err = uploadToS3(s.conn, f.Name(), s.bucket, key, s.storageClass, fn)
+		return err
+	})
 
 	return
 }
@@ -118,8 +132,6 @@ func (s3backendStorageFile S3BackendStorageFile) ReadAt(p []byte, off int64) (n 
 
 	bytesRange := fmt.Sprintf("bytes=%d-%d", off, off+int64(len(p))-1)
 
-	// glog.V(0).Infof("read %s %s", s3backendStorageFile.key, bytesRange)
-
 	getObjectOutput, getObjectErr := s3backendStorageFile.backendStorage.conn.GetObject(&s3.GetObjectInput{
 		Bucket: &s3backendStorageFile.backendStorage.bucket,
 		Key:    &s3backendStorageFile.key,
@@ -131,13 +143,16 @@ func (s3backendStorageFile S3BackendStorageFile) ReadAt(p []byte, off int64) (n 
 	}
 	defer getObjectOutput.Body.Close()
 
-	glog.V(4).Infof("read %s %s", s3backendStorageFile.key, bytesRange)
-	glog.V(4).Infof("content range: %s, contentLength: %d", *getObjectOutput.ContentRange, *getObjectOutput.ContentLength)
+	// glog.V(3).Infof("read %s %s", s3backendStorageFile.key, bytesRange)
+	// glog.V(3).Infof("content range: %s, contentLength: %d", *getObjectOutput.ContentRange, *getObjectOutput.ContentLength)
 
+	var readCount int
 	for {
-		if n, err = getObjectOutput.Body.Read(p); err == nil && n < len(p) {
-			p = p[n:]
-		} else {
+		p = p[readCount:]
+		readCount, err = getObjectOutput.Body.Read(p)
+		n += readCount
+
+		if err != nil {
 			break
 		}
 	}

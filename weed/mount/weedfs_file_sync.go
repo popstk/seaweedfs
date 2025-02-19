@@ -3,12 +3,14 @@ package mount
 import (
 	"context"
 	"fmt"
-	"github.com/chrislusf/seaweedfs/weed/filer"
-	"github.com/chrislusf/seaweedfs/weed/glog"
-	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
-	"github.com/hanwen/go-fuse/v2/fuse"
 	"syscall"
 	"time"
+
+	"github.com/hanwen/go-fuse/v2/fuse"
+	"github.com/seaweedfs/seaweedfs/weed/filer"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
 /**
@@ -55,9 +57,6 @@ func (wfs *WFS) Flush(cancel <-chan struct{}, in *fuse.FlushIn) fuse.Status {
 		return fuse.ENOENT
 	}
 
-	fh.Lock()
-	defer fh.Unlock()
-
 	return wfs.doFlush(fh, in.Uid, in.Gid)
 }
 
@@ -87,19 +86,17 @@ func (wfs *WFS) Fsync(cancel <-chan struct{}, in *fuse.FsyncIn) (code fuse.Statu
 		return fuse.ENOENT
 	}
 
-	fh.Lock()
-	defer fh.Unlock()
-
 	return wfs.doFlush(fh, in.Uid, in.Gid)
 
 }
 
 func (wfs *WFS) doFlush(fh *FileHandle, uid, gid uint32) fuse.Status {
+
 	// flush works at fh level
 	fileFullPath := fh.FullPath()
 	dir, name := fileFullPath.DirAndName()
 	// send the data to the OS
-	glog.V(4).Infof("doFlush %s fh %d", fileFullPath, fh.handle)
+	glog.V(4).Infof("doFlush %s fh %d", fileFullPath, fh.fh)
 
 	if !wfs.IsOverQuota {
 		if err := fh.dirtyPages.FlushData(); err != nil {
@@ -116,12 +113,12 @@ func (wfs *WFS) doFlush(fh *FileHandle, uid, gid uint32) fuse.Status {
 		return fuse.Status(syscall.ENOSPC)
 	}
 
+	fhActiveLock := fh.wfs.fhLockTable.AcquireLock("doFlush", fh.fh, util.ExclusiveLock)
+	defer fh.wfs.fhLockTable.ReleaseLock(fh.fh, fhActiveLock)
+
 	err := wfs.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
 
-		entry := fh.entry
-		if entry == nil {
-			return nil
-		}
+		entry := fh.GetEntry()
 		entry.Name = name // this flush may be just after a rename operation
 
 		if entry.Attributes != nil {
@@ -132,26 +129,22 @@ func (wfs *WFS) doFlush(fh *FileHandle, uid, gid uint32) fuse.Status {
 			if entry.Attributes.Gid == 0 {
 				entry.Attributes.Gid = gid
 			}
-			if entry.Attributes.Crtime == 0 {
-				entry.Attributes.Crtime = time.Now().Unix()
-			}
 			entry.Attributes.Mtime = time.Now().Unix()
-			entry.Attributes.Collection, entry.Attributes.Replication = fh.dirtyPages.GetStorageOptions()
 		}
 
 		request := &filer_pb.CreateEntryRequest{
 			Directory:                string(dir),
-			Entry:                    entry,
+			Entry:                    entry.GetEntry(),
 			Signatures:               []int32{wfs.signature},
 			SkipCheckParentDirectory: true,
 		}
 
-		glog.V(4).Infof("%s set chunks: %v", fileFullPath, len(entry.Chunks))
-		for i, chunk := range entry.Chunks {
-			glog.V(4).Infof("%s chunks %d: %v [%d,%d)", fileFullPath, i, chunk.GetFileIdString(), chunk.Offset, chunk.Offset+int64(chunk.Size))
-		}
+		glog.V(4).Infof("%s set chunks: %v", fileFullPath, len(entry.GetChunks()))
+		//for i, chunk := range entry.GetChunks() {
+		//	glog.V(4).Infof("%s chunks %d: %v [%d,%d)", fileFullPath, i, chunk.GetFileIdString(), chunk.Offset, chunk.Offset+int64(chunk.Size))
+		//}
 
-		manifestChunks, nonManifestChunks := filer.SeparateManifestChunks(entry.Chunks)
+		manifestChunks, nonManifestChunks := filer.SeparateManifestChunks(entry.GetChunks())
 
 		chunks, _ := filer.CompactFileChunks(wfs.LookupFn(), nonManifestChunks)
 		chunks, manifestErr := filer.MaybeManifestize(wfs.saveDataAsChunk(fileFullPath), chunks)
@@ -179,8 +172,12 @@ func (wfs *WFS) doFlush(fh *FileHandle, uid, gid uint32) fuse.Status {
 	}
 
 	if err != nil {
-		glog.Errorf("%v fh %d flush: %v", fileFullPath, fh.handle, err)
+		glog.Errorf("%v fh %d flush: %v", fileFullPath, fh.fh, err)
 		return fuse.EIO
+	}
+
+	if IsDebugFileReadWrite {
+		fh.mirrorFile.Sync()
 	}
 
 	return fuse.OK

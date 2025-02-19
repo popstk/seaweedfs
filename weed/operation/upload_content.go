@@ -2,21 +2,27 @@ package operation
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/chrislusf/seaweedfs/weed/glog"
-	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
-	"github.com/chrislusf/seaweedfs/weed/security"
-	"github.com/chrislusf/seaweedfs/weed/util"
+	"github.com/valyala/bytebufferpool"
 	"io"
 	"mime"
 	"mime/multipart"
-	"net"
 	"net/http"
 	"net/textproto"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/security"
+	"github.com/seaweedfs/seaweedfs/weed/stats"
+	"github.com/seaweedfs/seaweedfs/weed/util"
+	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
+	util_http_client "github.com/seaweedfs/seaweedfs/weed/util/http/client"
 )
 
 type UploadOption struct {
@@ -27,6 +33,9 @@ type UploadOption struct {
 	MimeType          string
 	PairMap           map[string]string
 	Jwt               security.EncodedJwt
+	RetryForever      bool
+	Md5               string
+	BytesBuffer       *bytes.Buffer
 }
 
 type UploadResult struct {
@@ -41,13 +50,13 @@ type UploadResult struct {
 	RetryCount int    `json:"-"`
 }
 
-func (uploadResult *UploadResult) ToPbFileChunk(fileId string, offset int64) *filer_pb.FileChunk {
+func (uploadResult *UploadResult) ToPbFileChunk(fileId string, offset int64, tsNs int64) *filer_pb.FileChunk {
 	fid, _ := filer_pb.ToFileIdObject(fileId)
 	return &filer_pb.FileChunk{
 		FileId:       fileId,
 		Offset:       offset,
 		Size:         uint64(uploadResult.Size),
-		Mtime:        time.Now().UnixNano(),
+		ModifiedTsNs: tsNs,
 		ETag:         uploadResult.ContentMd5,
 		CipherKey:    uploadResult.CipherKey,
 		IsCompressed: uploadResult.Gzip > 0,
@@ -55,41 +64,105 @@ func (uploadResult *UploadResult) ToPbFileChunk(fileId string, offset int64) *fi
 	}
 }
 
+var (
+	fileNameEscaper = strings.NewReplacer(`\`, `\\`, `"`, `\"`, "\n", "")
+	uploader        *Uploader
+	uploaderErr     error
+	once            sync.Once
+)
+
 // HTTPClient interface for testing
 type HTTPClient interface {
 	Do(req *http.Request) (*http.Response, error)
 }
 
-var (
-	HttpClient HTTPClient
-)
-
-func init() {
-	HttpClient = &http.Client{Transport: &http.Transport{
-		DialContext: (&net.Dialer{
-			Timeout:   10 * time.Second,
-			KeepAlive: 10 * time.Second,
-		}).DialContext,
-		MaxIdleConns:        1024,
-		MaxIdleConnsPerHost: 1024,
-	}}
+// Uploader
+type Uploader struct {
+	httpClient HTTPClient
 }
 
-var fileNameEscaper = strings.NewReplacer(`\`, `\\`, `"`, `\"`, "\n", "")
+func NewUploader() (*Uploader, error) {
+	once.Do(func() {
+		// With Dial context
+		var httpClient *util_http_client.HTTPClient
+		httpClient, uploaderErr = util_http.NewGlobalHttpClient(util_http_client.AddDialContext)
+		if uploaderErr != nil {
+			uploaderErr = fmt.Errorf("error initializing the loader: %s", uploaderErr)
+		}
+		if httpClient != nil {
+			uploader = newUploader(httpClient)
+		}
+	})
+	return uploader, uploaderErr
+}
+
+func newUploader(httpClient HTTPClient) *Uploader {
+	return &Uploader{
+		httpClient: httpClient,
+	}
+}
+
+// UploadWithRetry will retry both assigning volume request and uploading content
+// The option parameter does not need to specify UploadUrl and Jwt, which will come from assigning volume.
+func (uploader *Uploader) UploadWithRetry(filerClient filer_pb.FilerClient, assignRequest *filer_pb.AssignVolumeRequest, uploadOption *UploadOption, genFileUrlFn func(host, fileId string) string, reader io.Reader) (fileId string, uploadResult *UploadResult, err error, data []byte) {
+	doUploadFunc := func() error {
+
+		var host string
+		var auth security.EncodedJwt
+
+		// grpc assign volume
+		if grpcAssignErr := filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+			resp, assignErr := client.AssignVolume(context.Background(), assignRequest)
+			if assignErr != nil {
+				glog.V(0).Infof("assign volume failure %v: %v", assignRequest, assignErr)
+				return assignErr
+			}
+			if resp.Error != "" {
+				return fmt.Errorf("assign volume failure %v: %v", assignRequest, resp.Error)
+			}
+
+			fileId, auth = resp.FileId, security.EncodedJwt(resp.Auth)
+			loc := resp.Location
+			host = filerClient.AdjustedUrl(loc)
+
+			return nil
+		}); grpcAssignErr != nil {
+			return fmt.Errorf("filerGrpcAddress assign volume: %v", grpcAssignErr)
+		}
+
+		uploadOption.UploadUrl = genFileUrlFn(host, fileId)
+		uploadOption.Jwt = auth
+
+		var uploadErr error
+		uploadResult, uploadErr, data = uploader.doUpload(reader, uploadOption)
+		return uploadErr
+	}
+	if uploadOption.RetryForever {
+		util.RetryUntil("uploadWithRetryForever", doUploadFunc, func(err error) (shouldContinue bool) {
+			glog.V(0).Infof("upload content: %v", err)
+			return true
+		})
+	} else {
+		uploadErrList := []string{"transport", "is read only"}
+		err = util.MultiRetry("uploadWithRetry", uploadErrList, doUploadFunc)
+	}
+
+	return
+}
 
 // Upload sends a POST request to a volume server to upload the content with adjustable compression level
-func UploadData(data []byte, option *UploadOption) (uploadResult *UploadResult, err error) {
-	uploadResult, err = retriedUploadData(data, option)
+func (uploader *Uploader) UploadData(data []byte, option *UploadOption) (uploadResult *UploadResult, err error) {
+	uploadResult, err = uploader.retriedUploadData(data, option)
 	return
 }
 
 // Upload sends a POST request to a volume server to upload the content with fast compression
-func Upload(reader io.Reader, option *UploadOption) (uploadResult *UploadResult, err error, data []byte) {
-	uploadResult, err, data = doUpload(reader, option)
+func (uploader *Uploader) Upload(reader io.Reader, option *UploadOption) (uploadResult *UploadResult, err error, data []byte) {
+	uploadResult, err, data = uploader.doUpload(reader, option)
 	return
 }
 
-func doUpload(reader io.Reader, option *UploadOption) (uploadResult *UploadResult, err error, data []byte) {
+func (uploader *Uploader) doUpload(reader io.Reader, option *UploadOption) (uploadResult *UploadResult, err error, data []byte) {
 	bytesReader, ok := reader.(*util.BytesReader)
 	if ok {
 		data = bytesReader.Bytes
@@ -100,25 +173,26 @@ func doUpload(reader io.Reader, option *UploadOption) (uploadResult *UploadResul
 			return
 		}
 	}
-	uploadResult, uploadErr := retriedUploadData(data, option)
+	uploadResult, uploadErr := uploader.retriedUploadData(data, option)
 	return uploadResult, uploadErr, data
 }
 
-func retriedUploadData(data []byte, option *UploadOption) (uploadResult *UploadResult, err error) {
+func (uploader *Uploader) retriedUploadData(data []byte, option *UploadOption) (uploadResult *UploadResult, err error) {
 	for i := 0; i < 3; i++ {
-		uploadResult, err = doUploadData(data, option)
+		if i > 0 {
+			time.Sleep(time.Millisecond * time.Duration(237*(i+1)))
+		}
+		uploadResult, err = uploader.doUploadData(data, option)
 		if err == nil {
 			uploadResult.RetryCount = i
 			return
-		} else {
-			glog.Warningf("uploading to %s: %v", option.UploadUrl, err)
 		}
-		time.Sleep(time.Millisecond * time.Duration(237*(i+1)))
+		glog.Warningf("uploading %d to %s: %v", i, option.UploadUrl, err)
 	}
 	return
 }
 
-func doUploadData(data []byte, option *UploadOption) (uploadResult *UploadResult, err error) {
+func (uploader *Uploader) doUploadData(data []byte, option *UploadOption) (uploadResult *UploadResult, err error) {
 	contentIsGzipped := option.IsInputCompressed
 	shouldGzipNow := false
 	if !option.IsInputCompressed {
@@ -134,6 +208,9 @@ func doUploadData(data []byte, option *UploadOption) (uploadResult *UploadResult
 		} else if !iAmSure && option.MimeType == "" && len(data) > 16*1024 {
 			var compressed []byte
 			compressed, err = util.GzipData(data[0:128])
+			if err != nil {
+				return
+			}
 			shouldGzipNow = len(compressed)*10 < 128*9 // can not compress to less than 90%
 		}
 	}
@@ -144,7 +221,7 @@ func doUploadData(data []byte, option *UploadOption) (uploadResult *UploadResult
 	// this could be double copying
 	clearDataLen = len(data)
 	clearData := data
-	if shouldGzipNow && !option.Cipher {
+	if shouldGzipNow {
 		compressed, compressErr := util.GzipData(data)
 		// fmt.Printf("data is compressed from %d ==> %d\n", len(data), len(compressed))
 		if compressErr == nil {
@@ -164,14 +241,14 @@ func doUploadData(data []byte, option *UploadOption) (uploadResult *UploadResult
 
 		// encrypt
 		cipherKey := util.GenCipherKey()
-		encryptedData, encryptionErr := util.Encrypt(clearData, cipherKey)
+		encryptedData, encryptionErr := util.Encrypt(data, cipherKey)
 		if encryptionErr != nil {
 			err = fmt.Errorf("encrypt input: %v", encryptionErr)
 			return
 		}
 
 		// upload data
-		uploadResult, err = upload_content(func(w io.Writer) (err error) {
+		uploadResult, err = uploader.upload_content(func(w io.Writer) (err error) {
 			_, err = w.Write(encryptedData)
 			return
 		}, len(encryptedData), &UploadOption{
@@ -190,9 +267,12 @@ func doUploadData(data []byte, option *UploadOption) (uploadResult *UploadResult
 		uploadResult.Mime = option.MimeType
 		uploadResult.CipherKey = cipherKey
 		uploadResult.Size = uint32(clearDataLen)
+		if contentIsGzipped {
+			uploadResult.Gzip = 1
+		}
 	} else {
 		// upload data
-		uploadResult, err = upload_content(func(w io.Writer) (err error) {
+		uploadResult, err = uploader.upload_content(func(w io.Writer) (err error) {
 			_, err = w.Write(data)
 			return
 		}, len(data), &UploadOption{
@@ -203,6 +283,8 @@ func doUploadData(data []byte, option *UploadOption) (uploadResult *UploadResult
 			MimeType:          option.MimeType,
 			PairMap:           option.PairMap,
 			Jwt:               option.Jwt,
+			Md5:               option.Md5,
+			BytesBuffer:       option.BytesBuffer,
 		})
 		if uploadResult == nil {
 			return
@@ -216,10 +298,18 @@ func doUploadData(data []byte, option *UploadOption) (uploadResult *UploadResult
 	return uploadResult, err
 }
 
-func upload_content(fillBufferFunction func(w io.Writer) error, originalDataSize int, option *UploadOption) (*UploadResult, error) {
-	buf := GetBuffer()
-	defer PutBuffer(buf)
-	body_writer := multipart.NewWriter(buf)
+func (uploader *Uploader) upload_content(fillBufferFunction func(w io.Writer) error, originalDataSize int, option *UploadOption) (*UploadResult, error) {
+	var body_writer *multipart.Writer
+	var reqReader *bytes.Reader
+	var buf *bytebufferpool.ByteBuffer
+	if option.BytesBuffer == nil {
+		buf = GetBuffer()
+		defer PutBuffer(buf)
+		body_writer = multipart.NewWriter(buf)
+	} else {
+		option.BytesBuffer.Reset()
+		body_writer = multipart.NewWriter(option.BytesBuffer)
+	}
 	h := make(textproto.MIMEHeader)
 	filename := fileNameEscaper.Replace(option.Filename)
 	h.Set("Content-Disposition", fmt.Sprintf(`form-data; name="file"; filename="%s"`, filename))
@@ -232,6 +322,9 @@ func upload_content(fillBufferFunction func(w io.Writer) error, originalDataSize
 	}
 	if option.IsInputCompressed {
 		h.Set("Content-Encoding", "gzip")
+	}
+	if option.Md5 != "" {
+		h.Set("Content-MD5", option.Md5)
 	}
 
 	file_writer, cp_err := body_writer.CreatePart(h)
@@ -248,8 +341,12 @@ func upload_content(fillBufferFunction func(w io.Writer) error, originalDataSize
 		glog.V(0).Infoln("error closing body", err)
 		return nil, err
 	}
-
-	req, postErr := http.NewRequest("POST", option.UploadUrl, bytes.NewReader(buf.Bytes()))
+	if option.BytesBuffer == nil {
+		reqReader = bytes.NewReader(buf.Bytes())
+	} else {
+		reqReader = bytes.NewReader(option.BytesBuffer.Bytes())
+	}
+	req, postErr := http.NewRequest(http.MethodPost, option.UploadUrl, reqReader)
 	if postErr != nil {
 		glog.V(1).Infof("create upload request %s: %v", option.UploadUrl, postErr)
 		return nil, fmt.Errorf("create upload request %s: %v", option.UploadUrl, postErr)
@@ -262,19 +359,21 @@ func upload_content(fillBufferFunction func(w io.Writer) error, originalDataSize
 		req.Header.Set("Authorization", "BEARER "+string(option.Jwt))
 	}
 	// print("+")
-	resp, post_err := HttpClient.Do(req)
+	resp, post_err := uploader.httpClient.Do(req)
+	defer util_http.CloseResponse(resp)
 	if post_err != nil {
 		if strings.Contains(post_err.Error(), "connection reset by peer") ||
 			strings.Contains(post_err.Error(), "use of closed network connection") {
 			glog.V(1).Infof("repeat error upload request %s: %v", option.UploadUrl, postErr)
-			resp, post_err = HttpClient.Do(req)
+			stats.FilerHandlerCounter.WithLabelValues(stats.RepeatErrorUploadContent).Inc()
+			resp, post_err = uploader.httpClient.Do(req)
+			defer util_http.CloseResponse(resp)
 		}
 	}
 	if post_err != nil {
 		return nil, fmt.Errorf("upload %s %d bytes to %v: %v", option.Filename, originalDataSize, option.UploadUrl, post_err)
 	}
 	// print("-")
-	defer util.CloseResponse(resp)
 
 	var ret UploadResult
 	etag := getEtag(resp)

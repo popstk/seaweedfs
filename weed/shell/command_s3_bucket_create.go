@@ -4,11 +4,11 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/s3api/s3bucket"
 	"io"
 	"os"
 	"time"
-
-	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
 )
 
 func init() {
@@ -26,23 +26,29 @@ func (c *commandS3BucketCreate) Help() string {
 	return `create a bucket with a given name
 
 	Example:
-		s3.bucket.create -name <bucket_name> -replication 001
+		s3.bucket.create -name <bucket_name>
 `
+}
+
+func (c *commandS3BucketCreate) HasTag(CommandTag) bool {
+	return false
 }
 
 func (c *commandS3BucketCreate) Do(args []string, commandEnv *CommandEnv, writer io.Writer) (err error) {
 
 	bucketCommand := flag.NewFlagSet(c.Name(), flag.ContinueOnError)
 	bucketName := bucketCommand.String("name", "", "bucket name")
-	replication := bucketCommand.String("replication", "", "replication setting for the bucket, if not set "+
-		"it will honor the value defined by the filer if it exists, "+
-		"else it will honor the value defined on the master")
 	if err = bucketCommand.Parse(args); err != nil {
 		return nil
 	}
 
 	if *bucketName == "" {
 		return fmt.Errorf("empty bucket name")
+	}
+
+	err = s3bucket.VerifyS3BucketName(*bucketName)
+	if err != nil {
+		return err
 	}
 
 	err = commandEnv.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
@@ -59,11 +65,9 @@ func (c *commandS3BucketCreate) Do(args []string, commandEnv *CommandEnv, writer
 			Name:        *bucketName,
 			IsDirectory: true,
 			Attributes: &filer_pb.FuseAttributes{
-				Mtime:       time.Now().Unix(),
-				Crtime:      time.Now().Unix(),
-				FileMode:    uint32(0777 | os.ModeDir),
-				Collection:  *bucketName,
-				Replication: *replication,
+				Mtime:    time.Now().Unix(),
+				Crtime:   time.Now().Unix(),
+				FileMode: uint32(0777 | os.ModeDir),
 			},
 		}
 

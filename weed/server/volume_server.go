@@ -1,20 +1,22 @@
 package weed_server
 
 import (
-	"github.com/chrislusf/seaweedfs/weed/pb"
-	"github.com/chrislusf/seaweedfs/weed/pb/volume_server_pb"
-	"github.com/chrislusf/seaweedfs/weed/storage/types"
 	"net/http"
 	"sync"
+	"time"
+
+	"github.com/seaweedfs/seaweedfs/weed/pb"
+	"github.com/seaweedfs/seaweedfs/weed/pb/volume_server_pb"
+	"github.com/seaweedfs/seaweedfs/weed/storage/types"
 
 	"google.golang.org/grpc"
 
-	"github.com/chrislusf/seaweedfs/weed/stats"
-	"github.com/chrislusf/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/stats"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 
-	"github.com/chrislusf/seaweedfs/weed/glog"
-	"github.com/chrislusf/seaweedfs/weed/security"
-	"github.com/chrislusf/seaweedfs/weed/storage"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/security"
+	"github.com/seaweedfs/seaweedfs/weed/storage"
 )
 
 type VolumeServer struct {
@@ -25,8 +27,12 @@ type VolumeServer struct {
 	concurrentDownloadLimit       int64
 	inFlightUploadDataLimitCond   *sync.Cond
 	inFlightDownloadDataLimitCond *sync.Cond
+	inflightUploadDataTimeout     time.Duration
+	hasSlowRead                   bool
+	readBufferSizeMB              int
 
 	SeedMasterNodes []pb.ServerAddress
+	whiteList       []string
 	currentMaster   pb.ServerAddress
 	pulseSeconds    int
 	dataCenter      string
@@ -36,6 +42,7 @@ type VolumeServer struct {
 	grpcDialOption  grpc.DialOption
 
 	needleMapKind           storage.NeedleMapKind
+	ldbTimout               int64
 	FixJpgOrientation       bool
 	ReadMode                string
 	compactionBytePerSecond int64
@@ -48,7 +55,7 @@ type VolumeServer struct {
 
 func NewVolumeServer(adminMux, publicMux *http.ServeMux, ip string,
 	port int, grpcPort int, publicUrl string,
-	folders []string, maxCounts []int, minFreeSpaces []util.MinFreeSpace, diskTypes []types.DiskType,
+	folders []string, maxCounts []int32, minFreeSpaces []util.MinFreeSpace, diskTypes []types.DiskType,
 	idxFolder string,
 	needleMapKind storage.NeedleMapKind,
 	masterNodes []pb.ServerAddress, pulseSeconds int,
@@ -60,6 +67,10 @@ func NewVolumeServer(adminMux, publicMux *http.ServeMux, ip string,
 	fileSizeLimitMB int,
 	concurrentUploadLimit int64,
 	concurrentDownloadLimit int64,
+	inflightUploadDataTimeout time.Duration,
+	hasSlowRead bool,
+	readBufferSizeMB int,
+	ldbTimeout int64,
 ) *VolumeServer {
 
 	v := util.GetViper()
@@ -88,12 +99,19 @@ func NewVolumeServer(adminMux, publicMux *http.ServeMux, ip string,
 		inFlightDownloadDataLimitCond: sync.NewCond(new(sync.Mutex)),
 		concurrentUploadLimit:         concurrentUploadLimit,
 		concurrentDownloadLimit:       concurrentDownloadLimit,
+		inflightUploadDataTimeout:     inflightUploadDataTimeout,
+		hasSlowRead:                   hasSlowRead,
+		readBufferSizeMB:              readBufferSizeMB,
+		ldbTimout:                     ldbTimeout,
+		whiteList:                     whiteList,
 	}
+
+	whiteList = append(whiteList, util.StringSplit(v.GetString("guard.white_list"), ",")...)
 	vs.SeedMasterNodes = masterNodes
 
 	vs.checkWithMaster()
 
-	vs.store = storage.NewStore(vs.grpcDialOption, ip, port, grpcPort, publicUrl, folders, maxCounts, minFreeSpaces, idxFolder, vs.needleMapKind, diskTypes)
+	vs.store = storage.NewStore(vs.grpcDialOption, ip, port, grpcPort, publicUrl, folders, maxCounts, minFreeSpaces, idxFolder, vs.needleMapKind, diskTypes, ldbTimeout)
 	vs.guard = security.NewGuard(whiteList, signingKey, expiresAfterSec, readSigningKey, readExpiresAfterSec)
 
 	handleStaticResources(adminMux)
@@ -126,8 +144,21 @@ func (vs *VolumeServer) SetStopping() {
 	vs.store.SetStopping()
 }
 
+func (vs *VolumeServer) LoadNewVolumes() {
+	glog.V(0).Infoln(" Loading new volume ids ...")
+	vs.store.LoadNewVolumes()
+}
+
 func (vs *VolumeServer) Shutdown() {
 	glog.V(0).Infoln("Shutting down volume server...")
 	vs.store.Close()
 	glog.V(0).Infoln("Shut down successfully!")
+}
+
+func (vs *VolumeServer) Reload() {
+	glog.V(0).Infoln("Reload volume server...")
+
+	util.LoadConfiguration("security", false)
+	v := util.GetViper()
+	vs.guard.UpdateWhiteList(append(vs.whiteList, util.StringSplit(v.GetString("guard.white_list"), ",")...))
 }

@@ -4,8 +4,8 @@ import (
 	"os"
 	"time"
 
-	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
-	"github.com/chrislusf/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
 type Attr struct {
@@ -15,10 +15,7 @@ type Attr struct {
 	Uid           uint32      // owner uid
 	Gid           uint32      // group gid
 	Mime          string      // mime type
-	Replication   string      // replication
-	Collection    string      // collection name
 	TtlSec        int32       // ttl in seconds
-	DiskType      string
 	UserName      string
 	GroupNames    []string
 	SymlinkTarget string
@@ -41,15 +38,16 @@ type Entry struct {
 	// the following is for files
 	Chunks []*filer_pb.FileChunk `json:"chunks,omitempty"`
 
-	HardLinkId      HardLinkId
-	HardLinkCounter int32
-	Content         []byte
-	Remote          *filer_pb.RemoteEntry
-	Quota           int64
+	HardLinkId         HardLinkId
+	HardLinkCounter    int32
+	Content            []byte
+	Remote             *filer_pb.RemoteEntry
+	Quota              int64
+	WORMEnforcedAtTsNs int64
 }
 
 func (entry *Entry) Size() uint64 {
-	return maxUint64(maxUint64(TotalSize(entry.Chunks), entry.FileSize), uint64(len(entry.Content)))
+	return maxUint64(maxUint64(TotalSize(entry.GetChunks()), entry.FileSize), uint64(len(entry.Content)))
 }
 
 func (entry *Entry) Timestamp() time.Time {
@@ -94,13 +92,14 @@ func (entry *Entry) ToExistingProtoEntry(message *filer_pb.Entry) {
 	}
 	message.IsDirectory = entry.IsDirectory()
 	message.Attributes = EntryAttributeToPb(entry)
-	message.Chunks = entry.Chunks
+	message.Chunks = entry.GetChunks()
 	message.Extended = entry.Extended
 	message.HardLinkId = entry.HardLinkId
 	message.HardLinkCounter = entry.HardLinkCounter
 	message.Content = entry.Content
 	message.RemoteEntry = entry.Remote
 	message.Quota = entry.Quota
+	message.WormEnforcedAtTsNs = entry.WORMEnforcedAtTsNs
 }
 
 func FromPbEntryToExistingEntry(message *filer_pb.Entry, fsEntry *Entry) {
@@ -112,6 +111,8 @@ func FromPbEntryToExistingEntry(message *filer_pb.Entry, fsEntry *Entry) {
 	fsEntry.Content = message.Content
 	fsEntry.Remote = message.RemoteEntry
 	fsEntry.Quota = message.Quota
+	fsEntry.FileSize = FileSize(message)
+	fsEntry.WORMEnforcedAtTsNs = message.WormEnforcedAtTsNs
 }
 
 func (entry *Entry) ToProtoFullEntry() *filer_pb.FullEntry {
@@ -123,6 +124,10 @@ func (entry *Entry) ToProtoFullEntry() *filer_pb.FullEntry {
 		Dir:   dir,
 		Entry: entry.ToProtoEntry(),
 	}
+}
+
+func (entry *Entry) GetChunks() []*filer_pb.FileChunk {
+	return entry.Chunks
 }
 
 func FromPbEntry(dir string, entry *filer_pb.Entry) *Entry {

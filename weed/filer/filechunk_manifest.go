@@ -3,19 +3,19 @@ package filer
 import (
 	"bytes"
 	"fmt"
-	"github.com/chrislusf/seaweedfs/weed/wdclient"
 	"io"
 	"math"
-	"net/url"
-	"strings"
 	"sync"
 	"time"
 
-	"github.com/golang/protobuf/proto"
+	"github.com/seaweedfs/seaweedfs/weed/wdclient"
 
-	"github.com/chrislusf/seaweedfs/weed/glog"
-	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
-	"github.com/chrislusf/seaweedfs/weed/util"
+	"google.golang.org/protobuf/proto"
+
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/util"
+	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
 )
 
 const (
@@ -63,17 +63,17 @@ func ResolveChunkManifest(lookupFileIdFn wdclient.LookupFileIdFunctionType, chun
 
 		resolvedChunks, err := ResolveOneChunkManifest(lookupFileIdFn, chunk)
 		if err != nil {
-			return chunks, nil, err
+			return dataChunks, nil, err
 		}
 
 		manifestChunks = append(manifestChunks, chunk)
 		// recursive
-		dataChunks, manifestChunks, subErr := ResolveChunkManifest(lookupFileIdFn, resolvedChunks, startOffset, stopOffset)
+		subDataChunks, subManifestChunks, subErr := ResolveChunkManifest(lookupFileIdFn, resolvedChunks, startOffset, stopOffset)
 		if subErr != nil {
-			return chunks, nil, subErr
+			return dataChunks, nil, subErr
 		}
-		dataChunks = append(dataChunks, dataChunks...)
-		manifestChunks = append(manifestChunks, manifestChunks...)
+		dataChunks = append(dataChunks, subDataChunks...)
+		manifestChunks = append(manifestChunks, subManifestChunks...)
 	}
 	return
 }
@@ -108,7 +108,7 @@ func fetchWholeChunk(bytesBuffer *bytes.Buffer, lookupFileIdFn wdclient.LookupFi
 		glog.Errorf("operation LookupFileId %s failed, err: %v", fileId, err)
 		return err
 	}
-	err = retriedStreamFetchChunkData(bytesBuffer, urlStrings, cipherKey, isGzipped, true, 0, 0)
+	err = retriedStreamFetchChunkData(bytesBuffer, urlStrings, "", cipherKey, isGzipped, true, 0, 0)
 	if err != nil {
 		return err
 	}
@@ -121,69 +121,40 @@ func fetchChunkRange(buffer []byte, lookupFileIdFn wdclient.LookupFileIdFunction
 		glog.Errorf("operation LookupFileId %s failed, err: %v", fileId, err)
 		return 0, err
 	}
-	return retriedFetchChunkData(buffer, urlStrings, cipherKey, isGzipped, false, offset)
+	return util_http.RetriedFetchChunkData(buffer, urlStrings, cipherKey, isGzipped, false, offset)
 }
 
-func retriedFetchChunkData(buffer []byte, urlStrings []string, cipherKey []byte, isGzipped bool, isFullChunk bool, offset int64) (n int, err error) {
-
-	var shouldRetry bool
-
-	for waitTime := time.Second; waitTime < util.RetryWaitTime; waitTime += waitTime / 2 {
-		for _, urlString := range urlStrings {
-			n = 0
-			if strings.Contains(urlString, "%") {
-				urlString = url.PathEscape(urlString)
-			}
-			shouldRetry, err = util.ReadUrlAsStream(urlString+"?readDeleted=true", cipherKey, isGzipped, isFullChunk, offset, len(buffer), func(data []byte) {
-				if n < len(buffer) {
-					x := copy(buffer[n:], data)
-					n += x
-				}
-			})
-			if !shouldRetry {
-				break
-			}
-			if err != nil {
-				glog.V(0).Infof("read %s failed, err: %v", urlString, err)
-			} else {
-				break
-			}
-		}
-		if err != nil && shouldRetry {
-			glog.V(0).Infof("retry reading in %v", waitTime)
-			time.Sleep(waitTime)
-		} else {
-			break
-		}
-	}
-
-	return n, err
-
-}
-
-func retriedStreamFetchChunkData(writer io.Writer, urlStrings []string, cipherKey []byte, isGzipped bool, isFullChunk bool, offset int64, size int) (err error) {
+func retriedStreamFetchChunkData(writer io.Writer, urlStrings []string, jwt string, cipherKey []byte, isGzipped bool, isFullChunk bool, offset int64, size int) (err error) {
 
 	var shouldRetry bool
 	var totalWritten int
 
 	for waitTime := time.Second; waitTime < util.RetryWaitTime; waitTime += waitTime / 2 {
+		retriedCnt := 0
 		for _, urlString := range urlStrings {
-			var localProcesed int
-			shouldRetry, err = util.ReadUrlAsStream(urlString+"?readDeleted=true", cipherKey, isGzipped, isFullChunk, offset, size, func(data []byte) {
-				if totalWritten > localProcesed {
-					toBeSkipped := totalWritten - localProcesed
+			retriedCnt++
+			var localProcessed int
+			var writeErr error
+			shouldRetry, err = util_http.ReadUrlAsStreamAuthenticated(urlString+"?readDeleted=true", jwt, cipherKey, isGzipped, isFullChunk, offset, size, func(data []byte) {
+				if totalWritten > localProcessed {
+					toBeSkipped := totalWritten - localProcessed
 					if len(data) <= toBeSkipped {
-						localProcesed += len(data)
+						localProcessed += len(data)
 						return // skip if already processed
 					}
 					data = data[toBeSkipped:]
-					localProcesed += toBeSkipped
+					localProcessed += toBeSkipped
 				}
-				writer.Write(data)
-				localProcesed += len(data)
-				totalWritten += len(data)
+				var writtenCount int
+				writtenCount, writeErr = writer.Write(data)
+				localProcessed += writtenCount
+				totalWritten += writtenCount
 			})
 			if !shouldRetry {
+				break
+			}
+			if writeErr != nil {
+				err = writeErr
 				break
 			}
 			if err != nil {
@@ -191,6 +162,10 @@ func retriedStreamFetchChunkData(writer io.Writer, urlStrings []string, cipherKe
 			} else {
 				break
 			}
+		}
+		// all nodes have tried it
+		if retriedCnt == len(urlStrings) {
+			break
 		}
 		if err != nil && shouldRetry {
 			glog.V(0).Infof("retry reading in %v", waitTime)
@@ -257,7 +232,7 @@ func mergeIntoManifest(saveFunc SaveDataAsChunkFunctionType, dataChunks []*filer
 		}
 	}
 
-	manifestChunk, _, _, err = saveFunc(bytes.NewReader(data), "", 0)
+	manifestChunk, err = saveFunc(bytes.NewReader(data), "", 0, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -268,4 +243,4 @@ func mergeIntoManifest(saveFunc SaveDataAsChunkFunctionType, dataChunks []*filer
 	return
 }
 
-type SaveDataAsChunkFunctionType func(reader io.Reader, name string, offset int64) (chunk *filer_pb.FileChunk, collection, replication string, err error)
+type SaveDataAsChunkFunctionType func(reader io.Reader, name string, offset int64, tsNs int64) (chunk *filer_pb.FileChunk, err error)

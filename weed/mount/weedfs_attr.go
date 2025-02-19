@@ -1,30 +1,33 @@
 package mount
 
 import (
-	"github.com/chrislusf/seaweedfs/weed/filer"
-	"github.com/chrislusf/seaweedfs/weed/glog"
-	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
-	"github.com/hanwen/go-fuse/v2/fuse"
 	"os"
 	"syscall"
 	"time"
+
+	"github.com/hanwen/go-fuse/v2/fuse"
+	"github.com/seaweedfs/seaweedfs/weed/filer"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 )
 
 func (wfs *WFS) GetAttr(cancel <-chan struct{}, input *fuse.GetAttrIn, out *fuse.AttrOut) (code fuse.Status) {
+	glog.V(4).Infof("GetAttr %v", input.NodeId)
 	if input.NodeId == 1 {
 		wfs.setRootAttr(out)
 		return fuse.OK
 	}
 
-	_, _, entry, status := wfs.maybeReadEntry(input.NodeId)
+	inode := input.NodeId
+	_, _, entry, status := wfs.maybeReadEntry(inode)
 	if status == fuse.OK {
 		out.AttrValid = 1
-		wfs.setAttrByPbEntry(&out.Attr, input.NodeId, entry)
+		wfs.setAttrByPbEntry(&out.Attr, inode, entry, true)
 		return status
 	} else {
-		if fh, found := wfs.fhmap.FindFileHandle(input.NodeId); found {
+		if fh, found := wfs.fhMap.FindFileHandle(inode); found {
 			out.AttrValid = 1
-			wfs.setAttrByPbEntry(&out.Attr, input.NodeId, fh.entry)
+			wfs.setAttrByPbEntry(&out.Attr, inode, fh.entry.GetEntry(), true)
 			out.Nlink = 0
 			return fuse.OK
 		}
@@ -40,17 +43,26 @@ func (wfs *WFS) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *fuse
 	}
 
 	path, fh, entry, status := wfs.maybeReadEntry(input.NodeId)
-	if status != fuse.OK {
+	if status != fuse.OK || entry == nil {
 		return status
+	}
+	if fh != nil {
+		fh.entryLock.Lock()
+		defer fh.entryLock.Unlock()
+	}
+
+	wormEnforced, wormEnabled := wfs.wormEnforcedForEntry(path, entry)
+	if wormEnforced {
+		return fuse.EPERM
 	}
 
 	if size, ok := input.GetSize(); ok {
-		glog.V(4).Infof("%v setattr set size=%v chunks=%d", path, size, len(entry.Chunks))
+		glog.V(4).Infof("%v setattr set size=%v chunks=%d", path, size, len(entry.GetChunks()))
 		if size < filer.FileSize(entry) {
 			// fmt.Printf("truncate %v \n", fullPath)
 			var chunks []*filer_pb.FileChunk
 			var truncatedChunks []*filer_pb.FileChunk
-			for _, chunk := range entry.Chunks {
+			for _, chunk := range entry.GetChunks() {
 				int64Size := int64(chunk.Size)
 				if chunk.Offset+int64Size > int64(size) {
 					// this chunk is truncated
@@ -63,12 +75,14 @@ func (wfs *WFS) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *fuse
 						glog.V(4).Infof("truncated whole chunk %+v\n", chunk.GetFileIdString())
 						truncatedChunks = append(truncatedChunks, chunk)
 					}
+				} else {
+					chunks = append(chunks, chunk)
 				}
 			}
 			// set the new chunks and reset entry cache
 			entry.Chunks = chunks
 			if fh != nil {
-				fh.entryViewCache = nil
+				fh.entryChunkGroup.SetChunks(chunks)
 			}
 		}
 		entry.Attributes.Mtime = time.Now().Unix()
@@ -77,6 +91,11 @@ func (wfs *WFS) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *fuse
 	}
 
 	if mode, ok := input.GetMode(); ok {
+		// commit the file to worm when it is set to readonly at the first time
+		if entry.WormEnforcedAtTsNs == 0 && wormEnabled && !hasWritePermission(mode) {
+			entry.WormEnforcedAtTsNs = time.Now().UnixNano()
+		}
+
 		// glog.V(4).Infof("setAttr mode %o", mode)
 		entry.Attributes.FileMode = chmod(entry.Attributes.FileMode, mode)
 		if input.NodeId == 1 {
@@ -98,17 +117,20 @@ func (wfs *WFS) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *fuse
 		}
 	}
 
-	if mtime, ok := input.GetMTime(); ok {
-		entry.Attributes.Mtime = mtime.Unix()
-	}
-
 	if atime, ok := input.GetATime(); ok {
 		entry.Attributes.Mtime = atime.Unix()
 	}
 
-	entry.Attributes.Mtime = time.Now().Unix()
+	if mtime, ok := input.GetMTime(); ok {
+		entry.Attributes.Mtime = mtime.Unix()
+	}
+
 	out.AttrValid = 1
-	wfs.setAttrByPbEntry(&out.Attr, input.NodeId, entry)
+	size, includeSize := input.GetSize()
+	if includeSize {
+		out.Attr.Size = size
+	}
+	wfs.setAttrByPbEntry(&out.Attr, input.NodeId, entry, !includeSize)
 
 	if fh != nil {
 		fh.dirtyMetadata = true
@@ -133,11 +155,22 @@ func (wfs *WFS) setRootAttr(out *fuse.AttrOut) {
 	out.Nlink = 1
 }
 
-func (wfs *WFS) setAttrByPbEntry(out *fuse.Attr, inode uint64, entry *filer_pb.Entry) {
+func (wfs *WFS) setAttrByPbEntry(out *fuse.Attr, inode uint64, entry *filer_pb.Entry, calculateSize bool) {
 	out.Ino = inode
-	out.Size = filer.FileSize(entry)
-	out.Blocks = (out.Size + blockSize - 1) / blockSize
 	setBlksize(out, blockSize)
+	if entry == nil {
+		return
+	}
+	if entry.Attributes != nil && entry.Attributes.Inode != 0 {
+		out.Ino = entry.Attributes.Inode
+	}
+	if calculateSize {
+		out.Size = filer.FileSize(entry)
+	}
+	if entry.FileMode()&os.ModeSymlink != 0 {
+		out.Size = uint64(len(entry.Attributes.SymlinkTarget))
+	}
+	out.Blocks = (out.Size + blockSize - 1) / blockSize
 	out.Mtime = uint64(entry.Attributes.Mtime)
 	out.Ctime = uint64(entry.Attributes.Mtime)
 	out.Atime = uint64(entry.Attributes.Mtime)
@@ -155,6 +188,9 @@ func (wfs *WFS) setAttrByPbEntry(out *fuse.Attr, inode uint64, entry *filer_pb.E
 func (wfs *WFS) setAttrByFilerEntry(out *fuse.Attr, inode uint64, entry *filer.Entry) {
 	out.Ino = inode
 	out.Size = entry.FileSize
+	if entry.Mode&os.ModeSymlink != 0 {
+		out.Size = uint64(len(entry.SymlinkTarget))
+	}
 	out.Blocks = (out.Size + blockSize - 1) / blockSize
 	setBlksize(out, blockSize)
 	out.Atime = uint64(entry.Attr.Mtime.Unix())
@@ -176,7 +212,7 @@ func (wfs *WFS) outputPbEntry(out *fuse.EntryOut, inode uint64, entry *filer_pb.
 	out.Generation = 1
 	out.EntryValid = 1
 	out.AttrValid = 1
-	wfs.setAttrByPbEntry(&out.Attr, inode, entry)
+	wfs.setAttrByPbEntry(&out.Attr, inode, entry, true)
 }
 
 func (wfs *WFS) outputFilerEntry(out *fuse.EntryOut, inode uint64, entry *filer.Entry) {
@@ -189,6 +225,14 @@ func (wfs *WFS) outputFilerEntry(out *fuse.EntryOut, inode uint64, entry *filer.
 
 func chmod(existing uint32, mode uint32) uint32 {
 	return existing&^07777 | mode&07777
+}
+
+const ownerWrite = 0o200
+const groupWrite = 0o020
+const otherWrite = 0o002
+
+func hasWritePermission(mode uint32) bool {
+	return (mode&ownerWrite != 0) || (mode&groupWrite != 0) || (mode&otherWrite != 0)
 }
 
 func toSyscallMode(mode os.FileMode) uint32 {

@@ -7,7 +7,7 @@ import (
 	"io"
 	"math"
 
-	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 )
 
 func init() {
@@ -25,6 +25,10 @@ func (c *commandS3BucketList) Help() string {
 	return `list all buckets
 
 `
+}
+
+func (c *commandS3BucketList) HasTag(CommandTag) bool {
+	return false
 }
 
 func (c *commandS3BucketList) Do(args []string, commandEnv *CommandEnv, writer io.Writer) (err error) {
@@ -57,18 +61,15 @@ func (c *commandS3BucketList) Do(args []string, commandEnv *CommandEnv, writer i
 		if !entry.IsDirectory {
 			return nil
 		}
-		collection := entry.Name
+		collection := getCollectionName(commandEnv, entry.Name)
 		var collectionSize, fileCount float64
 		if collectionInfo, found := collectionInfos[collection]; found {
 			collectionSize = collectionInfo.Size
 			fileCount = collectionInfo.FileCount - collectionInfo.DeleteCount
 		}
-		fmt.Fprintf(writer, "  %s\tsize:%.0f\tfile:%.0f", entry.Name, collectionSize, fileCount)
+		fmt.Fprintf(writer, "  %s\tsize:%.0f\tchunk:%.0f", entry.Name, collectionSize, fileCount)
 		if entry.Quota > 0 {
 			fmt.Fprintf(writer, "\tquota:%d\tusage:%.2f%%", entry.Quota, float64(collectionSize)*100/float64(entry.Quota))
-		}
-		if entry.Attributes.Replication != "" && entry.Attributes.Replication != "000" {
-			fmt.Fprintf(writer, "\treplication:%s", entry.Attributes.Replication)
 		}
 		fmt.Fprintln(writer)
 		return nil

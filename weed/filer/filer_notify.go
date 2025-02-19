@@ -3,17 +3,18 @@ package filer
 import (
 	"context"
 	"fmt"
+	"github.com/seaweedfs/seaweedfs/weed/util/log_buffer"
 	"io"
-	"math"
+	"regexp"
 	"strings"
 	"time"
 
-	"github.com/golang/protobuf/proto"
+	"google.golang.org/protobuf/proto"
 
-	"github.com/chrislusf/seaweedfs/weed/glog"
-	"github.com/chrislusf/seaweedfs/weed/notification"
-	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
-	"github.com/chrislusf/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/notification"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
 func (f *Filer) NotifyUpdateEvent(ctx context.Context, oldEntry, newEntry *Entry, deleteChunks, isFromOtherCluster bool, signatures []int32) {
@@ -81,11 +82,11 @@ func (f *Filer) logMetaEvent(ctx context.Context, fullpath string, eventNotifica
 		return
 	}
 
-	f.LocalMetaLogBuffer.AddToBuffer([]byte(dir), data, event.TsNs)
+	f.LocalMetaLogBuffer.AddDataToBuffer([]byte(dir), data, event.TsNs)
 
 }
 
-func (f *Filer) logFlushFunc(startTime, stopTime time.Time, buf []byte) {
+func (f *Filer) logFlushFunc(logBuffer *log_buffer.LogBuffer, startTime, stopTime time.Time, buf []byte) {
 
 	if len(buf) == 0 {
 		return
@@ -94,13 +95,13 @@ func (f *Filer) logFlushFunc(startTime, stopTime time.Time, buf []byte) {
 	startTime, stopTime = startTime.UTC(), stopTime.UTC()
 
 	targetFile := fmt.Sprintf("%s/%04d-%02d-%02d/%02d-%02d.%08x", SystemLogDir,
-		startTime.Year(), startTime.Month(), startTime.Day(), startTime.Hour(), startTime.Minute(), f.UniqueFileId,
+		startTime.Year(), startTime.Month(), startTime.Day(), startTime.Hour(), startTime.Minute(), f.UniqueFilerId,
 		// startTime.Second(), startTime.Nanosecond(),
 	)
 
 	for {
 		if err := f.appendToFile(targetFile, buf); err != nil {
-			glog.V(1).Infof("log write failed %s: %v", targetFile, err)
+			glog.V(0).Infof("metadata log write failed %s: %v", targetFile, err)
 			time.Sleep(737 * time.Millisecond)
 		} else {
 			break
@@ -108,80 +109,40 @@ func (f *Filer) logFlushFunc(startTime, stopTime time.Time, buf []byte) {
 	}
 }
 
-func (f *Filer) ReadPersistedLogBuffer(startTime time.Time, eachLogEntryFn func(logEntry *filer_pb.LogEntry) error) (lastTsNs int64, err error) {
+var (
+	VolumeNotFoundPattern = regexp.MustCompile(`volume \d+? not found`)
+)
 
-	startTime = startTime.UTC()
-	startDate := fmt.Sprintf("%04d-%02d-%02d", startTime.Year(), startTime.Month(), startTime.Day())
-	startHourMinute := fmt.Sprintf("%02d-%02d", startTime.Hour(), startTime.Minute())
+func (f *Filer) ReadPersistedLogBuffer(startPosition log_buffer.MessagePosition, stopTsNs int64, eachLogEntryFn log_buffer.EachLogEntryFuncType) (lastTsNs int64, isDone bool, err error) {
 
-	sizeBuf := make([]byte, 4)
-	startTsNs := startTime.UnixNano()
-
-	dayEntries, _, listDayErr := f.ListDirectoryEntries(context.Background(), SystemLogDir, startDate, true, 366, "", "", "")
-	if listDayErr != nil {
-		return lastTsNs, fmt.Errorf("fail to list log by day: %v", listDayErr)
-	}
-	for _, dayEntry := range dayEntries {
-		// println("checking day", dayEntry.FullPath)
-		hourMinuteEntries, _, listHourMinuteErr := f.ListDirectoryEntries(context.Background(), util.NewFullPath(SystemLogDir, dayEntry.Name()), "", false, math.MaxInt32, "", "", "")
-		if listHourMinuteErr != nil {
-			return lastTsNs, fmt.Errorf("fail to list log %s by day: %v", dayEntry.Name(), listHourMinuteErr)
+	visitor, visitErr := f.collectPersistedLogBuffer(startPosition, stopTsNs)
+	if visitErr != nil {
+		if visitErr == io.EOF {
+			return
 		}
-		for _, hourMinuteEntry := range hourMinuteEntries {
-			// println("checking hh-mm", hourMinuteEntry.FullPath)
-			if dayEntry.Name() == startDate {
-				hourMinute := util.FileNameBase(hourMinuteEntry.Name())
-				if strings.Compare(hourMinute, startHourMinute) < 0 {
-					continue
-				}
-			}
-			// println("processing", hourMinuteEntry.FullPath)
-			chunkedFileReader := NewChunkStreamReaderFromFiler(f.MasterClient, hourMinuteEntry.Chunks)
-			if lastTsNs, err = ReadEachLogEntry(chunkedFileReader, sizeBuf, startTsNs, eachLogEntryFn); err != nil {
-				chunkedFileReader.Close()
-				if err == io.EOF {
-					continue
-				}
-				return lastTsNs, fmt.Errorf("reading %s: %v", hourMinuteEntry.FullPath, err)
-			}
-			chunkedFileReader.Close()
-		}
+		err = fmt.Errorf("reading from persisted logs: %v", visitErr)
+		return
 	}
-
-	return lastTsNs, nil
-}
-
-func ReadEachLogEntry(r io.Reader, sizeBuf []byte, ns int64, eachLogEntryFn func(logEntry *filer_pb.LogEntry) error) (lastTsNs int64, err error) {
+	var logEntry *filer_pb.LogEntry
 	for {
-		n, err := r.Read(sizeBuf)
-		if err != nil {
-			return lastTsNs, err
+		logEntry, visitErr = visitor.GetNext()
+		if visitErr != nil {
+			if visitErr == io.EOF {
+				break
+			}
+			err = fmt.Errorf("read next from persisted logs: %v", visitErr)
+			return
 		}
-		if n != 4 {
-			return lastTsNs, fmt.Errorf("size %d bytes, expected 4 bytes", n)
+		isDone, visitErr = eachLogEntryFn(logEntry)
+		if visitErr != nil {
+			err = fmt.Errorf("process persisted log entry: %v", visitErr)
+			return
 		}
-		size := util.BytesToUint32(sizeBuf)
-		// println("entry size", size)
-		entryData := make([]byte, size)
-		n, err = r.Read(entryData)
-		if err != nil {
-			return lastTsNs, err
-		}
-		if n != int(size) {
-			return lastTsNs, fmt.Errorf("entry data %d bytes, expected %d bytes", n, size)
-		}
-		logEntry := &filer_pb.LogEntry{}
-		if err = proto.Unmarshal(entryData, logEntry); err != nil {
-			return lastTsNs, err
-		}
-		if logEntry.TsNs <= ns {
-			continue
-		}
-		// println("each log: ", logEntry.TsNs)
-		if err := eachLogEntryFn(logEntry); err != nil {
-			return lastTsNs, err
-		} else {
-			lastTsNs = logEntry.TsNs
+		lastTsNs = logEntry.TsNs
+		if isDone {
+			return
 		}
 	}
+
+	return
 }

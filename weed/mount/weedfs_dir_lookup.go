@@ -2,11 +2,13 @@ package mount
 
 import (
 	"context"
-	"github.com/chrislusf/seaweedfs/weed/filer"
-	"github.com/chrislusf/seaweedfs/weed/glog"
-	"github.com/chrislusf/seaweedfs/weed/mount/meta_cache"
-	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
+
 	"github.com/hanwen/go-fuse/v2/fuse"
+
+	"github.com/seaweedfs/seaweedfs/weed/filer"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/mount/meta_cache"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 )
 
 // Lookup is called by the kernel when the VFS wants to know
@@ -27,7 +29,7 @@ func (wfs *WFS) Lookup(cancel <-chan struct{}, header *fuse.InHeader, name strin
 
 	fullFilePath := dirPath.Child(name)
 
-	visitErr := meta_cache.EnsureVisited(wfs.metaCache, wfs, dirPath, nil)
+	visitErr := meta_cache.EnsureVisited(wfs.metaCache, wfs, dirPath)
 	if visitErr != nil {
 		glog.Errorf("dir Lookup %s: %v", dirPath, visitErr)
 		return fuse.EIO
@@ -55,9 +57,13 @@ func (wfs *WFS) Lookup(cancel <-chan struct{}, header *fuse.InHeader, name strin
 
 	inode := wfs.inodeToPath.Lookup(fullFilePath, localEntry.Crtime.Unix(), localEntry.IsDirectory(), len(localEntry.HardLinkId) > 0, localEntry.Inode, true)
 
-	if fh, found := wfs.fhmap.FindFileHandle(inode); found && fh.entry != nil {
-		glog.V(4).Infof("lookup opened file %s size %d", dirPath.Child(localEntry.Name()), filer.FileSize(fh.entry))
-		localEntry = filer.FromPbEntry(string(dirPath), fh.entry)
+	if fh, found := wfs.fhMap.FindFileHandle(inode); found {
+		fh.entryLock.RLock()
+		if entry := fh.GetEntry().GetEntry(); entry != nil {
+			glog.V(4).Infof("lookup opened file %s size %d", dirPath.Child(localEntry.Name()), filer.FileSize(entry))
+			localEntry = filer.FromPbEntry(string(dirPath), entry)
+		}
+		fh.entryLock.RUnlock()
 	}
 
 	wfs.outputFilerEntry(out, inode, localEntry)

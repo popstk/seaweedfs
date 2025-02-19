@@ -9,12 +9,13 @@ import (
 
 	"google.golang.org/grpc"
 
-	"github.com/chrislusf/seaweedfs/weed/pb"
-	"github.com/chrislusf/seaweedfs/weed/security"
+	"github.com/seaweedfs/seaweedfs/weed/pb"
+	"github.com/seaweedfs/seaweedfs/weed/security"
 
-	"github.com/chrislusf/seaweedfs/weed/glog"
-	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
-	"github.com/chrislusf/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/util"
+	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
 )
 
 type ReplicationSource interface {
@@ -27,9 +28,13 @@ type FilerSource struct {
 	Dir            string
 	address        string
 	proxyByFiler   bool
+	dataCenter     string
+	signature      int32
 }
 
 func (fs *FilerSource) Initialize(configuration util.Configuration, prefix string) error {
+	fs.dataCenter = configuration.GetString(prefix + "dataCenter")
+	fs.signature = util.RandomInt32()
 	return fs.DoInitialize(
 		"",
 		configuration.GetString(prefix+"grpcAddress"),
@@ -84,7 +89,13 @@ func (fs *FilerSource) LookupFileId(part string) (fileUrls []string, err error) 
 
 	if !fs.proxyByFiler {
 		for _, loc := range locations.Locations {
-			fileUrls = append(fileUrls, fmt.Sprintf("http://%s/%s?readDeleted=true", loc.Url, part))
+			fileUrl := fmt.Sprintf("http://%s/%s?readDeleted=true", loc.Url, part)
+			// Prefer same data center
+			if fs.dataCenter != "" && fs.dataCenter == loc.DataCenter {
+				fileUrls = append([]string{fileUrl}, fileUrls...)
+			} else {
+				fileUrls = append(fileUrls, fileUrl)
+			}
 		}
 	} else {
 		fileUrls = append(fileUrls, fmt.Sprintf("http://%s/?proxyChunkId=%s", fs.address, part))
@@ -96,7 +107,7 @@ func (fs *FilerSource) LookupFileId(part string) (fileUrls []string, err error) 
 func (fs *FilerSource) ReadPart(fileId string) (filename string, header http.Header, resp *http.Response, err error) {
 
 	if fs.proxyByFiler {
-		return util.DownloadFile("http://"+fs.address+"/?proxyChunkId="+fileId, "")
+		return util_http.DownloadFile("http://"+fs.address+"/?proxyChunkId="+fileId, "")
 	}
 
 	fileUrls, err := fs.LookupFileId(fileId)
@@ -105,7 +116,7 @@ func (fs *FilerSource) ReadPart(fileId string) (filename string, header http.Hea
 	}
 
 	for _, fileUrl := range fileUrls {
-		filename, header, resp, err = util.DownloadFile(fileUrl, "")
+		filename, header, resp, err = util_http.DownloadFile(fileUrl, "")
 		if err != nil {
 			glog.V(1).Infof("fail to read from %s: %v", fileUrl, err)
 		} else {
@@ -120,15 +131,19 @@ var _ = filer_pb.FilerClient(&FilerSource{})
 
 func (fs *FilerSource) WithFilerClient(streamingMode bool, fn func(filer_pb.SeaweedFilerClient) error) error {
 
-	return pb.WithGrpcClient(streamingMode, func(grpcConnection *grpc.ClientConn) error {
+	return pb.WithGrpcClient(streamingMode, fs.signature, func(grpcConnection *grpc.ClientConn) error {
 		client := filer_pb.NewSeaweedFilerClient(grpcConnection)
 		return fn(client)
-	}, fs.grpcAddress, fs.grpcDialOption)
+	}, fs.grpcAddress, false, fs.grpcDialOption)
 
 }
 
 func (fs *FilerSource) AdjustedUrl(location *filer_pb.Location) string {
 	return location.Url
+}
+
+func (fs *FilerSource) GetDataCenter() string {
+	return fs.dataCenter
 }
 
 func volumeId(fileId string) string {

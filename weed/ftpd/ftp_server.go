@@ -3,7 +3,7 @@ package ftpd
 import (
 	"crypto/tls"
 	"errors"
-	"github.com/chrislusf/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 	"net"
 
 	ftpserver "github.com/fclairamb/ftpserverlib"
@@ -29,7 +29,7 @@ type SftpServer struct {
 
 var _ = ftpserver.MainDriver(&SftpServer{})
 
-// NewServer returns a new FTP server driver
+// NewFtpServer returns a new FTP server driver
 func NewFtpServer(ftpListener net.Listener, option *FtpServerOption) (*SftpServer, error) {
 	var err error
 	server := &SftpServer{

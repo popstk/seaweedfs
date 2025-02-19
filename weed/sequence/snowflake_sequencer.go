@@ -5,7 +5,7 @@ import (
 	"hash/fnv"
 
 	"github.com/bwmarrin/snowflake"
-	"github.com/chrislusf/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
 )
 
 // a simple snowflake Sequencer
@@ -41,9 +41,4 @@ func (m *SnowflakeSequencer) NextFileId(count uint64) uint64 {
 
 // ignore setmax as we are snowflake
 func (m *SnowflakeSequencer) SetMax(seenValue uint64) {
-}
-
-// return a new id as no Peek is stored
-func (m *SnowflakeSequencer) Peek() uint64 {
-	return uint64(m.node.Generate().Int64())
 }

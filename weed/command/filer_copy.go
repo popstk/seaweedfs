@@ -14,15 +14,14 @@ import (
 
 	"google.golang.org/grpc"
 
-	"github.com/chrislusf/seaweedfs/weed/filer"
-	"github.com/chrislusf/seaweedfs/weed/operation"
-	"github.com/chrislusf/seaweedfs/weed/pb"
-	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
-	"github.com/chrislusf/seaweedfs/weed/security"
-	"github.com/chrislusf/seaweedfs/weed/storage/needle"
-	"github.com/chrislusf/seaweedfs/weed/util"
-	"github.com/chrislusf/seaweedfs/weed/util/grace"
-	"github.com/chrislusf/seaweedfs/weed/wdclient"
+	"github.com/seaweedfs/seaweedfs/weed/filer"
+	"github.com/seaweedfs/seaweedfs/weed/operation"
+	"github.com/seaweedfs/seaweedfs/weed/pb"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/security"
+	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
+	"github.com/seaweedfs/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/util/grace"
 )
 
 var (
@@ -31,21 +30,21 @@ var (
 )
 
 type CopyOptions struct {
-	include           *string
-	replication       *string
-	collection        *string
-	ttl               *string
-	diskType          *string
-	maxMB             *int
-	masterClient      *wdclient.MasterClient
-	concurrenctFiles  *int
-	concurrenctChunks *int
-	grpcDialOption    grpc.DialOption
-	masters           []string
-	cipher            bool
-	ttlSec            int32
-	checkSize         *bool
-	verbose           *bool
+	include            *string
+	replication        *string
+	collection         *string
+	ttl                *string
+	diskType           *string
+	maxMB              *int
+	concurrentFiles    *int
+	concurrentChunks   *int
+	grpcDialOption     grpc.DialOption
+	masters            []string
+	cipher             bool
+	ttlSec             int32
+	checkSize          *bool
+	verbose            *bool
+	volumeServerAccess *string
 }
 
 func init() {
@@ -57,10 +56,11 @@ func init() {
 	copy.ttl = cmdFilerCopy.Flag.String("ttl", "", "time to live, e.g.: 1m, 1h, 1d, 1M, 1y")
 	copy.diskType = cmdFilerCopy.Flag.String("disk", "", "[hdd|ssd|<tag>] hard drive or solid state drive or any tag")
 	copy.maxMB = cmdFilerCopy.Flag.Int("maxMB", 4, "split files larger than the limit")
-	copy.concurrenctFiles = cmdFilerCopy.Flag.Int("c", 8, "concurrent file copy goroutines")
-	copy.concurrenctChunks = cmdFilerCopy.Flag.Int("concurrentChunks", 8, "concurrent chunk copy goroutines for each file")
+	copy.concurrentFiles = cmdFilerCopy.Flag.Int("c", 8, "concurrent file copy goroutines")
+	copy.concurrentChunks = cmdFilerCopy.Flag.Int("concurrentChunks", 8, "concurrent chunk copy goroutines for each file")
 	copy.checkSize = cmdFilerCopy.Flag.Bool("check.size", false, "copy when the target file size is different from the source file")
 	copy.verbose = cmdFilerCopy.Flag.Bool("verbose", false, "print out details during copying")
+	copy.volumeServerAccess = cmdFilerCopy.Flag.String("volumeServerAccess", "direct", "access volume servers by [direct|publicUrl]")
 }
 
 var cmdFilerCopy = &Command{
@@ -71,7 +71,7 @@ var cmdFilerCopy = &Command{
   It can copy one or a list of files or folders.
 
   If copying a whole folder recursively:
-  All files under the folder and subfolders will be copyed.
+  All files under the folder and sub folders will be copied.
   Optional parameter "-include" allows you to specify the file name patterns.
 
   If "maxMB" is set to a positive number, files larger than it would be split into chunks.
@@ -81,7 +81,7 @@ var cmdFilerCopy = &Command{
 
 func runCopy(cmd *Command, args []string) bool {
 
-	util.LoadConfiguration("security", false)
+	util.LoadSecurityConfiguration()
 
 	if len(args) <= 1 {
 		return false
@@ -141,7 +141,7 @@ func runCopy(cmd *Command, args []string) bool {
 		grace.SetupProfiling("filer.copy.cpu.pprof", "filer.copy.mem.pprof")
 	}
 
-	fileCopyTaskChan := make(chan FileCopyTask, *copy.concurrenctFiles)
+	fileCopyTaskChan := make(chan FileCopyTask, *copy.concurrentFiles)
 
 	go func() {
 		defer close(fileCopyTaskChan)
@@ -152,13 +152,14 @@ func runCopy(cmd *Command, args []string) bool {
 			}
 		}
 	}()
-	for i := 0; i < *copy.concurrenctFiles; i++ {
+	for i := 0; i < *copy.concurrentFiles; i++ {
 		waitGroup.Add(1)
 		go func() {
 			defer waitGroup.Done()
 			worker := FileCopyWorker{
 				options:      &copy,
 				filerAddress: filerAddress,
+				signature:    util.RandomInt32(),
 			}
 			if err := worker.copyFiles(fileCopyTaskChan); err != nil {
 				fmt.Fprintf(os.Stderr, "copy file error: %v\n", err)
@@ -172,7 +173,7 @@ func runCopy(cmd *Command, args []string) bool {
 }
 
 func readFilerConfiguration(grpcDialOption grpc.DialOption, filerGrpcAddress pb.ServerAddress) (masters []string, collection, replication string, dirBuckets string, maxMB uint32, cipher bool, err error) {
-	err = pb.WithGrpcFilerClient(false, filerGrpcAddress, grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
+	err = pb.WithGrpcFilerClient(false, 0, filerGrpcAddress, grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
 		resp, err := client.GetFilerConfiguration(context.Background(), &filer_pb.GetFilerConfigurationRequest{})
 		if err != nil {
 			return fmt.Errorf("get filer %s configuration: %v", filerGrpcAddress, err)
@@ -225,6 +226,7 @@ func genFileCopyTask(fileOrDir string, destPath string, fileCopyTaskChan chan Fi
 type FileCopyWorker struct {
 	options      *CopyOptions
 	filerAddress pb.ServerAddress
+	signature    int32
 }
 
 func (worker *FileCopyWorker) copyFiles(fileCopyTaskChan chan FileCopyTask) error {
@@ -302,7 +304,7 @@ func (worker *FileCopyWorker) checkExistingFileFirst(task FileCopyTask, f *os.Fi
 		return
 	}
 
-	err = pb.WithGrpcFilerClient(false, worker.filerAddress, worker.options.grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
+	err = pb.WithGrpcFilerClient(false, worker.signature, worker.filerAddress, worker.options.grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
 
 		request := &filer_pb.LookupDirectoryEntryRequest{
 			Directory: task.destinationUrlPath,
@@ -331,8 +333,6 @@ func (worker *FileCopyWorker) uploadFileAsOne(task FileCopyTask, f *os.File) err
 	var mimeType string
 
 	var chunks []*filer_pb.FileChunk
-	var assignResult *filer_pb.AssignVolumeResponse
-	var assignError error
 
 	if task.fileMode&os.ModeDir == 0 && task.fileSize > 0 {
 
@@ -342,84 +342,53 @@ func (worker *FileCopyWorker) uploadFileAsOne(task FileCopyTask, f *os.File) err
 			return err
 		}
 
-		err = util.Retry("upload", func() error {
-			// assign a volume
-			assignErr := pb.WithGrpcFilerClient(false, worker.filerAddress, worker.options.grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
+		uploader, uploaderErr := operation.NewUploader()
+		if uploaderErr != nil {
+			return uploaderErr
+		}
 
-				request := &filer_pb.AssignVolumeRequest{
-					Count:       1,
-					Replication: *worker.options.replication,
-					Collection:  *worker.options.collection,
-					TtlSec:      worker.options.ttlSec,
-					DiskType:    *worker.options.diskType,
-					Path:        task.destinationUrlPath,
-				}
-
-				assignResult, assignError = client.AssignVolume(context.Background(), request)
-				if assignError != nil {
-					return fmt.Errorf("assign volume failure %v: %v", request, assignError)
-				}
-				if assignResult.Error != "" {
-					return fmt.Errorf("assign volume failure %v: %v", request, assignResult.Error)
-				}
-				if assignResult.Location.Url == "" {
-					return fmt.Errorf("assign volume failure %v: %v", request, assignResult)
-				}
-				return nil
-			})
-			if assignErr != nil {
-				return assignErr
-			}
-
-			// upload data
-			targetUrl := "http://" + assignResult.Location.Url + "/" + assignResult.FileId
-			uploadOption := &operation.UploadOption{
-				UploadUrl:         targetUrl,
+		finalFileId, uploadResult, flushErr, _ := uploader.UploadWithRetry(
+			worker,
+			&filer_pb.AssignVolumeRequest{
+				Count:       1,
+				Replication: *worker.options.replication,
+				Collection:  *worker.options.collection,
+				TtlSec:      worker.options.ttlSec,
+				DiskType:    *worker.options.diskType,
+				Path:        task.destinationUrlPath,
+			},
+			&operation.UploadOption{
 				Filename:          fileName,
 				Cipher:            worker.options.cipher,
 				IsInputCompressed: false,
 				MimeType:          mimeType,
 				PairMap:           nil,
-				Jwt:               security.EncodedJwt(assignResult.Auth),
-			}
-			uploadResult, err := operation.UploadData(data, uploadOption)
-			if err != nil {
-				return fmt.Errorf("upload data %v to %s: %v\n", fileName, targetUrl, err)
-			}
-			if uploadResult.Error != "" {
-				return fmt.Errorf("upload %v to %s result: %v\n", fileName, targetUrl, uploadResult.Error)
-			}
-			if *worker.options.verbose {
-				fmt.Printf("uploaded %s to %s\n", fileName, targetUrl)
-			}
-
-			fmt.Printf("copied %s => http://%s%s%s\n", f.Name(), worker.filerAddress.ToHttpAddress(), task.destinationUrlPath, fileName)
-			chunks = append(chunks, uploadResult.ToPbFileChunk(assignResult.FileId, 0))
-
-			return nil
-		})
-		if err != nil {
-			return fmt.Errorf("upload %v: %v\n", fileName, err)
+			},
+			func(host, fileId string) string {
+				return fmt.Sprintf("http://%s/%s", host, fileId)
+			},
+			util.NewBytesReader(data),
+		)
+		if flushErr != nil {
+			return flushErr
 		}
-
+		chunks = append(chunks, uploadResult.ToPbFileChunk(finalFileId, 0, time.Now().UnixNano()))
 	}
 
-	if err := pb.WithGrpcFilerClient(false, worker.filerAddress, worker.options.grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
+	if err := pb.WithGrpcFilerClient(false, worker.signature, worker.filerAddress, worker.options.grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
 		request := &filer_pb.CreateEntryRequest{
 			Directory: task.destinationUrlPath,
 			Entry: &filer_pb.Entry{
 				Name: fileName,
 				Attributes: &filer_pb.FuseAttributes{
-					Crtime:      time.Now().Unix(),
-					Mtime:       time.Now().Unix(),
-					Gid:         task.gid,
-					Uid:         task.uid,
-					FileSize:    uint64(task.fileSize),
-					FileMode:    uint32(task.fileMode),
-					Mime:        mimeType,
-					Replication: *worker.options.replication,
-					Collection:  *worker.options.collection,
-					TtlSec:      worker.options.ttlSec,
+					Crtime:   time.Now().Unix(),
+					Mtime:    time.Now().Unix(),
+					Gid:      task.gid,
+					Uid:      task.uid,
+					FileSize: uint64(task.fileSize),
+					FileMode: uint32(task.fileMode),
+					Mime:     mimeType,
+					TtlSec:   worker.options.ttlSec,
 				},
 				Chunks: chunks,
 			},
@@ -443,10 +412,9 @@ func (worker *FileCopyWorker) uploadFileInChunks(task FileCopyTask, f *os.File, 
 
 	chunksChan := make(chan *filer_pb.FileChunk, chunkCount)
 
-	concurrentChunks := make(chan struct{}, *worker.options.concurrenctChunks)
+	concurrentChunks := make(chan struct{}, *worker.options.concurrentChunks)
 	var wg sync.WaitGroup
 	var uploadError error
-	var collection, replication string
 
 	fmt.Printf("uploading %s in %d chunks ...\n", fileName, chunkCount)
 	for i := int64(0); i < int64(chunkCount) && uploadError == nil; i++ {
@@ -457,64 +425,47 @@ func (worker *FileCopyWorker) uploadFileInChunks(task FileCopyTask, f *os.File, 
 				wg.Done()
 				<-concurrentChunks
 			}()
-			// assign a volume
-			var assignResult *filer_pb.AssignVolumeResponse
-			var assignError error
-			err := util.Retry("assignVolume", func() error {
-				return pb.WithGrpcFilerClient(false, worker.filerAddress, worker.options.grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
-					request := &filer_pb.AssignVolumeRequest{
-						Count:       1,
-						Replication: *worker.options.replication,
-						Collection:  *worker.options.collection,
-						TtlSec:      worker.options.ttlSec,
-						DiskType:    *worker.options.diskType,
-						Path:        task.destinationUrlPath + fileName,
-					}
 
-					assignResult, assignError = client.AssignVolume(context.Background(), request)
-					if assignError != nil {
-						return fmt.Errorf("assign volume failure %v: %v", request, assignError)
-					}
-					if assignResult.Error != "" {
-						return fmt.Errorf("assign volume failure %v: %v", request, assignResult.Error)
-					}
-					return nil
-				})
-			})
+			uploader, err := operation.NewUploader()
 			if err != nil {
-				uploadError = fmt.Errorf("Failed to assign from %v: %v\n", worker.options.masters, err)
+				uploadError = fmt.Errorf("upload data %v: %v\n", fileName, err)
 				return
 			}
 
-			targetUrl := "http://" + assignResult.Location.Url + "/" + assignResult.FileId
-			if collection == "" {
-				collection = assignResult.Collection
-			}
-			if replication == "" {
-				replication = assignResult.Replication
-			}
+			fileId, uploadResult, err, _ := uploader.UploadWithRetry(
+				worker,
+				&filer_pb.AssignVolumeRequest{
+					Count:       1,
+					Replication: *worker.options.replication,
+					Collection:  *worker.options.collection,
+					TtlSec:      worker.options.ttlSec,
+					DiskType:    *worker.options.diskType,
+					Path:        task.destinationUrlPath + fileName,
+				},
+				&operation.UploadOption{
+					Filename:          fileName + "-" + strconv.FormatInt(i+1, 10),
+					Cipher:            worker.options.cipher,
+					IsInputCompressed: false,
+					MimeType:          "",
+					PairMap:           nil,
+				},
+				func(host, fileId string) string {
+					return fmt.Sprintf("http://%s/%s", host, fileId)
+				},
+				io.NewSectionReader(f, i*chunkSize, chunkSize),
+			)
 
-			uploadOption := &operation.UploadOption{
-				UploadUrl:         targetUrl,
-				Filename:          fileName + "-" + strconv.FormatInt(i+1, 10),
-				Cipher:            worker.options.cipher,
-				IsInputCompressed: false,
-				MimeType:          "",
-				PairMap:           nil,
-				Jwt:               security.EncodedJwt(assignResult.Auth),
-			}
-			uploadResult, err, _ := operation.Upload(io.NewSectionReader(f, i*chunkSize, chunkSize), uploadOption)
 			if err != nil {
-				uploadError = fmt.Errorf("upload data %v to %s: %v\n", fileName, targetUrl, err)
+				uploadError = fmt.Errorf("upload data %v: %v\n", fileName, err)
 				return
 			}
 			if uploadResult.Error != "" {
-				uploadError = fmt.Errorf("upload %v to %s result: %v\n", fileName, targetUrl, uploadResult.Error)
+				uploadError = fmt.Errorf("upload %v result: %v\n", fileName, uploadResult.Error)
 				return
 			}
-			chunksChan <- uploadResult.ToPbFileChunk(assignResult.FileId, i*chunkSize)
+			chunksChan <- uploadResult.ToPbFileChunk(fileId, i*chunkSize, time.Now().UnixNano())
 
-			fmt.Printf("uploaded %s-%d to %s [%d,%d)\n", fileName, i+1, targetUrl, i*chunkSize, i*chunkSize+int64(uploadResult.Size))
+			fmt.Printf("uploaded %s-%d [%d,%d)\n", fileName, i+1, i*chunkSize, i*chunkSize+int64(uploadResult.Size))
 		}(i)
 	}
 	wg.Wait()
@@ -530,7 +481,7 @@ func (worker *FileCopyWorker) uploadFileInChunks(task FileCopyTask, f *os.File, 
 		for _, chunk := range chunks {
 			fileIds = append(fileIds, chunk.FileId)
 		}
-		operation.DeleteFiles(func() pb.ServerAddress {
+		operation.DeleteFileIds(func(_ context.Context) pb.ServerAddress {
 			return pb.ServerAddress(copy.masters[0])
 		}, false, worker.options.grpcDialOption, fileIds)
 		return uploadError
@@ -541,22 +492,20 @@ func (worker *FileCopyWorker) uploadFileInChunks(task FileCopyTask, f *os.File, 
 		return fmt.Errorf("create manifest: %v", manifestErr)
 	}
 
-	if err := pb.WithGrpcFilerClient(false, worker.filerAddress, worker.options.grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
+	if err := pb.WithGrpcFilerClient(false, worker.signature, worker.filerAddress, worker.options.grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
 		request := &filer_pb.CreateEntryRequest{
 			Directory: task.destinationUrlPath,
 			Entry: &filer_pb.Entry{
 				Name: fileName,
 				Attributes: &filer_pb.FuseAttributes{
-					Crtime:      time.Now().Unix(),
-					Mtime:       time.Now().Unix(),
-					Gid:         task.gid,
-					Uid:         task.uid,
-					FileSize:    uint64(task.fileSize),
-					FileMode:    uint32(task.fileMode),
-					Mime:        mimeType,
-					Replication: replication,
-					Collection:  collection,
-					TtlSec:      worker.options.ttlSec,
+					Crtime:   time.Now().Unix(),
+					Mtime:    time.Now().Unix(),
+					Gid:      task.gid,
+					Uid:      task.uid,
+					FileSize: uint64(task.fileSize),
+					FileMode: uint32(task.fileMode),
+					Mime:     mimeType,
+					TtlSec:   worker.options.ttlSec,
 				},
 				Chunks: manifestedChunks,
 			},
@@ -594,62 +543,64 @@ func detectMimeType(f *os.File) string {
 	return mimeType
 }
 
-func (worker *FileCopyWorker) saveDataAsChunk(reader io.Reader, name string, offset int64) (chunk *filer_pb.FileChunk, collection, replication string, err error) {
-
-	var fileId, host string
-	var auth security.EncodedJwt
-
-	if flushErr := pb.WithGrpcFilerClient(false, worker.filerAddress, worker.options.grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
-
-		ctx := context.Background()
-
-		assignErr := util.Retry("assignVolume", func() error {
-			request := &filer_pb.AssignVolumeRequest{
-				Count:       1,
-				Replication: *worker.options.replication,
-				Collection:  *worker.options.collection,
-				TtlSec:      worker.options.ttlSec,
-				DiskType:    *worker.options.diskType,
-				Path:        name,
-			}
-
-			resp, err := client.AssignVolume(ctx, request)
-			if err != nil {
-				return fmt.Errorf("assign volume failure %v: %v", request, err)
-			}
-			if resp.Error != "" {
-				return fmt.Errorf("assign volume failure %v: %v", request, resp.Error)
-			}
-
-			fileId, host, auth = resp.FileId, resp.Location.Url, security.EncodedJwt(resp.Auth)
-			collection, replication = resp.Collection, resp.Replication
-
-			return nil
-		})
-		if assignErr != nil {
-			return assignErr
-		}
-
-		return nil
-	}); flushErr != nil {
-		return nil, collection, replication, fmt.Errorf("filerGrpcAddress assign volume: %v", flushErr)
+func (worker *FileCopyWorker) saveDataAsChunk(reader io.Reader, name string, offset int64, tsNs int64) (chunk *filer_pb.FileChunk, err error) {
+	uploader, uploaderErr := operation.NewUploader()
+	if uploaderErr != nil {
+		return nil, fmt.Errorf("upload data: %v", uploaderErr)
 	}
 
-	uploadOption := &operation.UploadOption{
-		UploadUrl:         fmt.Sprintf("http://%s/%s", host, fileId),
-		Filename:          name,
-		Cipher:            worker.options.cipher,
-		IsInputCompressed: false,
-		MimeType:          "",
-		PairMap:           nil,
-		Jwt:               auth,
-	}
-	uploadResult, flushErr, _ := operation.Upload(reader, uploadOption)
+	finalFileId, uploadResult, flushErr, _ := uploader.UploadWithRetry(
+		worker,
+		&filer_pb.AssignVolumeRequest{
+			Count:       1,
+			Replication: *worker.options.replication,
+			Collection:  *worker.options.collection,
+			TtlSec:      worker.options.ttlSec,
+			DiskType:    *worker.options.diskType,
+			Path:        name,
+		},
+		&operation.UploadOption{
+			Filename:          name,
+			Cipher:            worker.options.cipher,
+			IsInputCompressed: false,
+			MimeType:          "",
+			PairMap:           nil,
+		},
+		func(host, fileId string) string {
+			return fmt.Sprintf("http://%s/%s", host, fileId)
+		},
+		reader,
+	)
+
 	if flushErr != nil {
-		return nil, collection, replication, fmt.Errorf("upload data: %v", flushErr)
+		return nil, fmt.Errorf("upload data: %v", flushErr)
 	}
 	if uploadResult.Error != "" {
-		return nil, collection, replication, fmt.Errorf("upload result: %v", uploadResult.Error)
+		return nil, fmt.Errorf("upload result: %v", uploadResult.Error)
 	}
-	return uploadResult.ToPbFileChunk(fileId, offset), collection, replication, nil
+	return uploadResult.ToPbFileChunk(finalFileId, offset, tsNs), nil
+}
+
+var _ = filer_pb.FilerClient(&FileCopyWorker{})
+
+func (worker *FileCopyWorker) WithFilerClient(streamingMode bool, fn func(filer_pb.SeaweedFilerClient) error) (err error) {
+
+	filerGrpcAddress := worker.filerAddress.ToGrpcAddress()
+	err = pb.WithGrpcClient(streamingMode, worker.signature, func(grpcConnection *grpc.ClientConn) error {
+		client := filer_pb.NewSeaweedFilerClient(grpcConnection)
+		return fn(client)
+	}, filerGrpcAddress, false, worker.options.grpcDialOption)
+
+	return
+}
+
+func (worker *FileCopyWorker) AdjustedUrl(location *filer_pb.Location) string {
+	if *worker.options.volumeServerAccess == "publicUrl" {
+		return location.PublicUrl
+	}
+	return location.Url
+}
+
+func (worker *FileCopyWorker) GetDataCenter() string {
+	return ""
 }

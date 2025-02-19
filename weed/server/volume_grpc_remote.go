@@ -3,12 +3,12 @@ package weed_server
 import (
 	"context"
 	"fmt"
-	"github.com/chrislusf/seaweedfs/weed/operation"
-	"github.com/chrislusf/seaweedfs/weed/pb/volume_server_pb"
-	"github.com/chrislusf/seaweedfs/weed/remote_storage"
-	"github.com/chrislusf/seaweedfs/weed/security"
-	"github.com/chrislusf/seaweedfs/weed/storage/needle"
-	"github.com/chrislusf/seaweedfs/weed/storage/types"
+	"github.com/seaweedfs/seaweedfs/weed/operation"
+	"github.com/seaweedfs/seaweedfs/weed/pb/volume_server_pb"
+	"github.com/seaweedfs/seaweedfs/weed/remote_storage"
+	"github.com/seaweedfs/seaweedfs/weed/security"
+	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
+	"github.com/seaweedfs/seaweedfs/weed/storage/types"
 	"sync"
 	"time"
 )
@@ -49,8 +49,10 @@ func (vs *VolumeServer) FetchAndWriteNeedle(ctx context.Context, req *volume_ser
 		n.SetHasLastModifiedDate()
 		if _, localWriteErr := vs.store.WriteVolumeNeedle(v.Id, n, true, false); localWriteErr != nil {
 			if err == nil {
-				err = fmt.Errorf("local write needle %d size %d: %v", req.NeedleId, req.Size, err)
+				err = fmt.Errorf("local write needle %d size %d: %v", req.NeedleId, req.Size, localWriteErr)
 			}
+		} else {
+			resp.ETag = n.Etag()
 		}
 	}()
 	if len(req.Replicas) > 0 {
@@ -68,10 +70,15 @@ func (vs *VolumeServer) FetchAndWriteNeedle(ctx context.Context, req *volume_ser
 					PairMap:           nil,
 					Jwt:               security.EncodedJwt(req.Auth),
 				}
-				if _, replicaWriteErr := operation.UploadData(data, uploadOption); replicaWriteErr != nil {
-					if err == nil {
-						err = fmt.Errorf("remote write needle %d size %d: %v", req.NeedleId, req.Size, err)
-					}
+
+				uploader, uploaderErr := operation.NewUploader()
+				if uploaderErr != nil && err == nil {
+					err = fmt.Errorf("remote write needle %d size %d: %v", req.NeedleId, req.Size, uploaderErr)
+					return
+				}
+
+				if _, replicaWriteErr := uploader.UploadData(data, uploadOption); replicaWriteErr != nil && err == nil {
+					err = fmt.Errorf("remote write needle %d size %d: %v", req.NeedleId, req.Size, replicaWriteErr)
 				}
 			}(replica.Url)
 		}

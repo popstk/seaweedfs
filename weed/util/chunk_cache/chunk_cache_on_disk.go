@@ -7,11 +7,11 @@ import (
 
 	"github.com/syndtr/goleveldb/leveldb/opt"
 
-	"github.com/chrislusf/seaweedfs/weed/glog"
-	"github.com/chrislusf/seaweedfs/weed/storage"
-	"github.com/chrislusf/seaweedfs/weed/storage/backend"
-	"github.com/chrislusf/seaweedfs/weed/storage/types"
-	"github.com/chrislusf/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/storage"
+	"github.com/seaweedfs/seaweedfs/weed/storage/backend"
+	"github.com/seaweedfs/seaweedfs/weed/storage/types"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
 // This implements an on disk cache
@@ -69,7 +69,7 @@ func LoadOrCreateChunkCacheVolume(fileName string, preallocate int64) (*ChunkCac
 		WriteBuffer:                   1 * 1024 * 1024, // default value is 4MiB
 		CompactionTableSizeMultiplier: 10,              // default value is 1
 	}
-	if v.nm, err = storage.NewLevelDbNeedleMap(v.fileName+".ldb", indexFile, opts); err != nil {
+	if v.nm, err = storage.NewLevelDbNeedleMap(v.fileName+".ldb", indexFile, opts, 0); err != nil {
 		return nil, fmt.Errorf("loading leveldb %s error: %v", v.fileName+".ldb", err)
 	}
 
@@ -110,8 +110,10 @@ func (v *ChunkCacheVolume) GetNeedle(key types.NeedleId) ([]byte, error) {
 	}
 	data := make([]byte, nv.Size)
 	if readSize, readErr := v.DataBackend.ReadAt(data, nv.Offset.ToActualOffset()); readErr != nil {
-		return nil, fmt.Errorf("read %s.dat [%d,%d): %v",
-			v.fileName, nv.Offset.ToActualOffset(), nv.Offset.ToActualOffset()+int64(nv.Size), readErr)
+		if readSize != int(nv.Size) {
+			return nil, fmt.Errorf("read %s.dat [%d,%d): %v",
+				v.fileName, nv.Offset.ToActualOffset(), nv.Offset.ToActualOffset()+int64(nv.Size), readErr)
+		}
 	} else {
 		if readSize != int(nv.Size) {
 			return nil, fmt.Errorf("read %d, expected %d", readSize, nv.Size)
@@ -128,13 +130,15 @@ func (v *ChunkCacheVolume) getNeedleSlice(key types.NeedleId, offset, length uin
 	}
 	wanted := min(int(length), int(nv.Size)-int(offset))
 	if wanted < 0 {
-		// should never happen, but better than panicing
+		// should never happen, but better than panicking
 		return nil, ErrorOutOfBounds
 	}
 	data := make([]byte, wanted)
 	if readSize, readErr := v.DataBackend.ReadAt(data, nv.Offset.ToActualOffset()+int64(offset)); readErr != nil {
-		return nil, fmt.Errorf("read %s.dat [%d,%d): %v",
-			v.fileName, nv.Offset.ToActualOffset()+int64(offset), int(nv.Offset.ToActualOffset())+int(offset)+wanted, readErr)
+		if readSize != wanted {
+			return nil, fmt.Errorf("read %s.dat [%d,%d): %v",
+				v.fileName, nv.Offset.ToActualOffset()+int64(offset), int(nv.Offset.ToActualOffset())+int(offset)+wanted, readErr)
+		}
 	} else {
 		if readSize != wanted {
 			return nil, fmt.Errorf("read %d, expected %d", readSize, wanted)
@@ -151,12 +155,14 @@ func (v *ChunkCacheVolume) readNeedleSliceAt(data []byte, key types.NeedleId, of
 	}
 	wanted := min(len(data), int(nv.Size)-int(offset))
 	if wanted < 0 {
-		// should never happen, but better than panicing
+		// should never happen, but better than panicking
 		return 0, ErrorOutOfBounds
 	}
 	if n, err = v.DataBackend.ReadAt(data, nv.Offset.ToActualOffset()+int64(offset)); err != nil {
-		return n, fmt.Errorf("read %s.dat [%d,%d): %v",
-			v.fileName, nv.Offset.ToActualOffset()+int64(offset), int(nv.Offset.ToActualOffset())+int(offset)+wanted, err)
+		if n != wanted {
+			return n, fmt.Errorf("read %s.dat [%d,%d): %v",
+				v.fileName, nv.Offset.ToActualOffset()+int64(offset), int(nv.Offset.ToActualOffset())+int(offset)+wanted, err)
+		}
 	} else {
 		if n != wanted {
 			return n, fmt.Errorf("read %d, expected %d", n, wanted)

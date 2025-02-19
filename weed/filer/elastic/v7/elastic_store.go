@@ -1,3 +1,6 @@
+//go:build elastic
+// +build elastic
+
 package elastic
 
 import (
@@ -6,12 +9,12 @@ import (
 	"math"
 	"strings"
 
-	"github.com/chrislusf/seaweedfs/weed/filer"
-	"github.com/chrislusf/seaweedfs/weed/glog"
-	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
-	weed_util "github.com/chrislusf/seaweedfs/weed/util"
 	jsoniter "github.com/json-iterator/go"
 	elastic "github.com/olivere/elastic/v7"
+	"github.com/seaweedfs/seaweedfs/weed/filer"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	weed_util "github.com/seaweedfs/seaweedfs/weed/util"
 )
 
 var (
@@ -75,12 +78,12 @@ func (store *ElasticStore) initialize(options []elastic.ClientOptionFunc) (err e
 	ctx := context.Background()
 	store.client, err = elastic.NewClient(options...)
 	if err != nil {
-		return fmt.Errorf("init elastic %v.", err)
+		return fmt.Errorf("init elastic %v", err)
 	}
 	if ok, err := store.client.IndexExists(indexKV).Do(ctx); err == nil && !ok {
 		_, err = store.client.CreateIndex(indexKV).Body(kvMappings).Do(ctx)
 		if err != nil {
-			return fmt.Errorf("create index(%s) %v.", indexKV, err)
+			return fmt.Errorf("create index(%s) %v", indexKV, err)
 		}
 	}
 	return nil
@@ -111,7 +114,7 @@ func (store *ElasticStore) InsertEntry(ctx context.Context, entry *filer.Entry) 
 	value, err := jsoniter.Marshal(esEntry)
 	if err != nil {
 		glog.Errorf("insert entry(%s) %v.", string(entry.FullPath), err)
-		return fmt.Errorf("insert entry %v.", err)
+		return fmt.Errorf("insert entry marshal %v", err)
 	}
 	_, err = store.client.Index().
 		Index(index).
@@ -121,7 +124,7 @@ func (store *ElasticStore) InsertEntry(ctx context.Context, entry *filer.Entry) 
 		Do(ctx)
 	if err != nil {
 		glog.Errorf("insert entry(%s) %v.", string(entry.FullPath), err)
-		return fmt.Errorf("insert entry %v.", err)
+		return fmt.Errorf("insert entry %v", err)
 	}
 	return nil
 }
@@ -156,8 +159,16 @@ func (store *ElasticStore) FindEntry(ctx context.Context, fullpath weed_util.Ful
 func (store *ElasticStore) DeleteEntry(ctx context.Context, fullpath weed_util.FullPath) (err error) {
 	index := getIndex(fullpath, false)
 	id := weed_util.Md5String([]byte(fullpath))
-	if strings.Count(string(fullpath), "/") == 1 {
-		return store.deleteIndex(ctx, index)
+	strFullpath := string(fullpath)
+
+	// A top-level subdirectory refers to an Elasticsearch index.
+	// If we delete an entry at the top level, we should attempt to delete the corresponding Elasticsearch index.
+	if strings.Count(strFullpath, "/") == 1 {
+		entry, err2 := store.FindEntry(ctx, fullpath)
+		if err2 == nil && entry.IsDirectory() {
+			bucketIndex := indexPrefix + strFullpath[1:]
+			store.deleteIndex(ctx, bucketIndex)
+		}
 	}
 	return store.deleteEntry(ctx, index, id)
 }
@@ -183,7 +194,7 @@ func (store *ElasticStore) deleteEntry(ctx context.Context, index, id string) (e
 		}
 	}
 	glog.Errorf("delete entry(index:%s,_id:%s) %v.", index, id, err)
-	return fmt.Errorf("delete entry %v.", err)
+	return fmt.Errorf("delete entry %v", err)
 }
 
 func (store *ElasticStore) DeleteFolderChildren(ctx context.Context, fullpath weed_util.FullPath) (err error) {

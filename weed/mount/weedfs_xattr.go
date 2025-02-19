@@ -1,11 +1,12 @@
 package mount
 
 import (
-	"github.com/hanwen/go-fuse/v2/fuse"
-	sys "golang.org/x/sys/unix"
 	"runtime"
 	"strings"
 	"syscall"
+
+	"github.com/hanwen/go-fuse/v2/fuse"
+	sys "golang.org/x/sys/unix"
 )
 
 const (
@@ -19,6 +20,10 @@ const (
 // number of bytes. If the buffer is too small, return ERANGE,
 // with the required buffer size.
 func (wfs *WFS) GetXAttr(cancel <-chan struct{}, header *fuse.InHeader, attr string, dest []byte) (size uint32, code fuse.Status) {
+
+	if wfs.option.DisableXAttr {
+		return 0, fuse.Status(syscall.ENOTSUP)
+	}
 
 	//validate attr name
 	if len(attr) > MAX_XATTR_NAME_SIZE {
@@ -56,19 +61,24 @@ func (wfs *WFS) GetXAttr(cancel <-chan struct{}, header *fuse.InHeader, attr str
 
 // SetXAttr writes an extended attribute.
 // https://man7.org/linux/man-pages/man2/setxattr.2.html
-//        By default (i.e., flags is zero), the extended attribute will be
-//       created if it does not exist, or the value will be replaced if
-//       the attribute already exists.  To modify these semantics, one of
-//       the following values can be specified in flags:
 //
-//       XATTR_CREATE
-//              Perform a pure create, which fails if the named attribute
-//              exists already.
+//	 By default (i.e., flags is zero), the extended attribute will be
+//	created if it does not exist, or the value will be replaced if
+//	the attribute already exists.  To modify these semantics, one of
+//	the following values can be specified in flags:
 //
-//       XATTR_REPLACE
-//              Perform a pure replace operation, which fails if the named
-//              attribute does not already exist.
+//	XATTR_CREATE
+//	       Perform a pure create, which fails if the named attribute
+//	       exists already.
+//
+//	XATTR_REPLACE
+//	       Perform a pure replace operation, which fails if the named
+//	       attribute does not already exist.
 func (wfs *WFS) SetXAttr(cancel <-chan struct{}, input *fuse.SetXAttrIn, attr string, data []byte) fuse.Status {
+
+	if wfs.option.DisableXAttr {
+		return fuse.Status(syscall.ENOTSUP)
+	}
 
 	if wfs.IsOverQuota {
 		return fuse.Status(syscall.ENOSPC)
@@ -94,10 +104,18 @@ func (wfs *WFS) SetXAttr(cancel <-chan struct{}, input *fuse.SetXAttrIn, attr st
 		}
 	}
 
-	path, _, entry, status := wfs.maybeReadEntry(input.NodeId)
+	path, fh, entry, status := wfs.maybeReadEntry(input.NodeId)
 	if status != fuse.OK {
 		return status
 	}
+	if entry == nil {
+		return fuse.ENOENT
+	}
+	if fh != nil {
+		fh.entryLock.Lock()
+		defer fh.entryLock.Unlock()
+	}
+
 	if entry.Extended == nil {
 		entry.Extended = make(map[string][]byte)
 	}
@@ -114,6 +132,11 @@ func (wfs *WFS) SetXAttr(cancel <-chan struct{}, input *fuse.SetXAttrIn, attr st
 		entry.Extended[XATTR_PREFIX+attr] = data
 	}
 
+	if fh != nil {
+		fh.dirtyMetadata = true
+		return fuse.OK
+	}
+
 	return wfs.saveEntry(path, entry)
 
 }
@@ -122,6 +145,11 @@ func (wfs *WFS) SetXAttr(cancel <-chan struct{}, input *fuse.SetXAttrIn, attr st
 // slice, and return the number of bytes. If the buffer is too
 // small, return ERANGE, with the required buffer size.
 func (wfs *WFS) ListXAttr(cancel <-chan struct{}, header *fuse.InHeader, dest []byte) (n uint32, code fuse.Status) {
+
+	if wfs.option.DisableXAttr {
+		return 0, fuse.Status(syscall.ENOTSUP)
+	}
+
 	_, _, entry, status := wfs.maybeReadEntry(header.NodeId)
 	if status != fuse.OK {
 		return 0, status
@@ -151,13 +179,26 @@ func (wfs *WFS) ListXAttr(cancel <-chan struct{}, header *fuse.InHeader, dest []
 
 // RemoveXAttr removes an extended attribute.
 func (wfs *WFS) RemoveXAttr(cancel <-chan struct{}, header *fuse.InHeader, attr string) fuse.Status {
+
+	if wfs.option.DisableXAttr {
+		return fuse.Status(syscall.ENOTSUP)
+	}
+
 	if len(attr) == 0 {
 		return fuse.EINVAL
 	}
-	path, _, entry, status := wfs.maybeReadEntry(header.NodeId)
+	path, fh, entry, status := wfs.maybeReadEntry(header.NodeId)
 	if status != fuse.OK {
 		return status
 	}
+	if entry == nil {
+		return fuse.OK
+	}
+	if fh != nil {
+		fh.entryLock.Lock()
+		defer fh.entryLock.Unlock()
+	}
+
 	if entry.Extended == nil {
 		return fuse.ENOATTR
 	}

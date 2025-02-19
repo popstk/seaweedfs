@@ -1,32 +1,59 @@
 package weed_server
 
 import (
+	"context"
 	"errors"
-	"github.com/chrislusf/seaweedfs/weed/glog"
-	"github.com/chrislusf/seaweedfs/weed/security"
-	"github.com/chrislusf/seaweedfs/weed/util"
 	"net/http"
+	"os"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
 
-	"github.com/chrislusf/seaweedfs/weed/stats"
+	"github.com/seaweedfs/seaweedfs/weed/filer"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/security"
+	"github.com/seaweedfs/seaweedfs/weed/util"
+
+	"github.com/seaweedfs/seaweedfs/weed/stats"
 )
 
 func (fs *FilerServer) filerHandler(w http.ResponseWriter, r *http.Request) {
-
 	start := time.Now()
 
-	if r.Method == "OPTIONS" {
-		stats.FilerRequestCounter.WithLabelValues("options").Inc()
-		OptionsHandler(w, r, false)
-		stats.FilerRequestHistogram.WithLabelValues("options").Observe(time.Since(start).Seconds())
-		return
+	inFlightGauge := stats.FilerInFlightRequestsGauge.WithLabelValues(r.Method)
+	inFlightGauge.Inc()
+	defer inFlightGauge.Dec()
+
+	statusRecorder := stats.NewStatusResponseWriter(w)
+	w = statusRecorder
+	origin := r.Header.Get("Origin")
+	if origin != "" {
+		if fs.option.AllowedOrigins == nil || len(fs.option.AllowedOrigins) == 0 || fs.option.AllowedOrigins[0] == "*" {
+			origin = "*"
+		} else {
+			originFound := false
+			for _, allowedOrigin := range fs.option.AllowedOrigins {
+				if origin == allowedOrigin {
+					originFound = true
+				}
+			}
+			if !originFound {
+				writeJsonError(w, r, http.StatusForbidden, errors.New("origin not allowed"))
+				return
+			}
+		}
+
+		w.Header().Set("Access-Control-Allow-Origin", origin)
+		w.Header().Set("Access-Control-Expose-Headers", "*")
+		w.Header().Set("Access-Control-Allow-Headers", "*")
+		w.Header().Set("Access-Control-Allow-Credentials", "true")
+		w.Header().Set("Access-Control-Allow-Methods", "PUT, POST, GET, DELETE, OPTIONS")
 	}
 
-	isReadHttpCall := r.Method == "GET" || r.Method == "HEAD"
-	if !fs.maybeCheckJwtAuthorization(r, !isReadHttpCall) {
-		writeJsonError(w, r, http.StatusUnauthorized, errors.New("wrong jwt"))
+	if r.Method == http.MethodOptions {
+		OptionsHandler(w, r, false)
 		return
 	}
 
@@ -36,42 +63,43 @@ func (fs *FilerServer) filerHandler(w http.ResponseWriter, r *http.Request) {
 		fileId = r.RequestURI[len("/?proxyChunkId="):]
 	}
 	if fileId != "" {
-		stats.FilerRequestCounter.WithLabelValues("proxy").Inc()
 		fs.proxyToVolumeServer(w, r, fileId)
-		stats.FilerRequestHistogram.WithLabelValues("proxy").Observe(time.Since(start).Seconds())
+		stats.FilerHandlerCounter.WithLabelValues(stats.ChunkProxy).Inc()
+		stats.FilerRequestHistogram.WithLabelValues(stats.ChunkProxy).Observe(time.Since(start).Seconds())
+		return
+	}
+	requestMethod := r.Method
+	defer func(method *string) {
+		stats.FilerRequestCounter.WithLabelValues(*method, strconv.Itoa(statusRecorder.Status)).Inc()
+		stats.FilerRequestHistogram.WithLabelValues(*method).Observe(time.Since(start).Seconds())
+	}(&requestMethod)
+
+	isReadHttpCall := r.Method == http.MethodGet || r.Method == http.MethodHead
+	if !fs.maybeCheckJwtAuthorization(r, !isReadHttpCall) {
+		writeJsonError(w, r, http.StatusUnauthorized, errors.New("wrong jwt"))
 		return
 	}
 
-	w.Header().Set("Server", "SeaweedFS Filer "+util.VERSION)
-	if r.Header.Get("Origin") != "" {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Credentials", "true")
-	}
+	w.Header().Set("Server", "SeaweedFS "+util.VERSION)
+
 	switch r.Method {
-	case "GET":
-		stats.FilerRequestCounter.WithLabelValues("get").Inc()
+	case http.MethodGet, http.MethodHead:
 		fs.GetOrHeadHandler(w, r)
-		stats.FilerRequestHistogram.WithLabelValues("get").Observe(time.Since(start).Seconds())
-	case "HEAD":
-		stats.FilerRequestCounter.WithLabelValues("head").Inc()
-		fs.GetOrHeadHandler(w, r)
-		stats.FilerRequestHistogram.WithLabelValues("head").Observe(time.Since(start).Seconds())
-	case "DELETE":
-		stats.FilerRequestCounter.WithLabelValues("delete").Inc()
+	case http.MethodDelete:
 		if _, ok := r.URL.Query()["tagging"]; ok {
 			fs.DeleteTaggingHandler(w, r)
 		} else {
 			fs.DeleteHandler(w, r)
 		}
-		stats.FilerRequestHistogram.WithLabelValues("delete").Observe(time.Since(start).Seconds())
-	case "POST", "PUT":
-
+	case http.MethodPost, http.MethodPut:
 		// wait until in flight data is less than the limit
 		contentLength := getContentLength(r)
 		fs.inFlightDataLimitCond.L.Lock()
-		for fs.option.ConcurrentUploadLimit != 0 && atomic.LoadInt64(&fs.inFlightDataSize) > fs.option.ConcurrentUploadLimit {
-			glog.V(4).Infof("wait because inflight data %d > %d", fs.inFlightDataSize, fs.option.ConcurrentUploadLimit)
+		inFlightDataSize := atomic.LoadInt64(&fs.inFlightDataSize)
+		for fs.option.ConcurrentUploadLimit != 0 && inFlightDataSize > fs.option.ConcurrentUploadLimit {
+			glog.V(4).Infof("wait because inflight data %d > %d", inFlightDataSize, fs.option.ConcurrentUploadLimit)
 			fs.inFlightDataLimitCond.Wait()
+			inFlightDataSize = atomic.LoadInt64(&fs.inFlightDataSize)
 		}
 		fs.inFlightDataLimitCond.L.Unlock()
 		atomic.AddInt64(&fs.inFlightDataSize, contentLength)
@@ -80,31 +108,58 @@ func (fs *FilerServer) filerHandler(w http.ResponseWriter, r *http.Request) {
 			fs.inFlightDataLimitCond.Signal()
 		}()
 
-		if r.Method == "PUT" {
-			stats.FilerRequestCounter.WithLabelValues("put").Inc()
+		if r.Method == http.MethodPut {
 			if _, ok := r.URL.Query()["tagging"]; ok {
 				fs.PutTaggingHandler(w, r)
 			} else {
 				fs.PostHandler(w, r, contentLength)
 			}
-			stats.FilerRequestHistogram.WithLabelValues("put").Observe(time.Since(start).Seconds())
 		} else { // method == "POST"
-			stats.FilerRequestCounter.WithLabelValues("post").Inc()
 			fs.PostHandler(w, r, contentLength)
-			stats.FilerRequestHistogram.WithLabelValues("post").Observe(time.Since(start).Seconds())
 		}
+	default:
+		requestMethod = "INVALID"
+		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
 }
 
 func (fs *FilerServer) readonlyFilerHandler(w http.ResponseWriter, r *http.Request) {
 
 	start := time.Now()
+	statusRecorder := stats.NewStatusResponseWriter(w)
+	w = statusRecorder
 
+	os.Stdout.WriteString("Request: " + r.Method + " " + r.URL.String() + "\n")
+
+	origin := r.Header.Get("Origin")
+	if origin != "" {
+		if fs.option.AllowedOrigins == nil || len(fs.option.AllowedOrigins) == 0 || fs.option.AllowedOrigins[0] == "*" {
+			origin = "*"
+		} else {
+			originFound := false
+			for _, allowedOrigin := range fs.option.AllowedOrigins {
+				if origin == allowedOrigin {
+					originFound = true
+				}
+			}
+			if !originFound {
+				writeJsonError(w, r, http.StatusForbidden, errors.New("origin not allowed"))
+				return
+			}
+		}
+
+		w.Header().Set("Access-Control-Allow-Origin", origin)
+		w.Header().Set("Access-Control-Allow-Headers", "OPTIONS, GET, HEAD")
+		w.Header().Set("Access-Control-Allow-Credentials", "true")
+	}
+	requestMethod := r.Method
+	defer func(method *string) {
+		stats.FilerRequestCounter.WithLabelValues(*method, strconv.Itoa(statusRecorder.Status)).Inc()
+		stats.FilerRequestHistogram.WithLabelValues(*method).Observe(time.Since(start).Seconds())
+	}(&requestMethod)
 	// We handle OPTIONS first because it never should be authenticated
-	if r.Method == "OPTIONS" {
-		stats.FilerRequestCounter.WithLabelValues("options").Inc()
+	if r.Method == http.MethodOptions {
 		OptionsHandler(w, r, true)
-		stats.FilerRequestHistogram.WithLabelValues("options").Observe(time.Since(start).Seconds())
 		return
 	}
 
@@ -113,30 +168,26 @@ func (fs *FilerServer) readonlyFilerHandler(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	w.Header().Set("Server", "SeaweedFS Filer "+util.VERSION)
-	if r.Header.Get("Origin") != "" {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Credentials", "true")
-	}
+	w.Header().Set("Server", "SeaweedFS "+util.VERSION)
+
 	switch r.Method {
-	case "GET":
-		stats.FilerRequestCounter.WithLabelValues("get").Inc()
+	case http.MethodGet, http.MethodHead:
 		fs.GetOrHeadHandler(w, r)
-		stats.FilerRequestHistogram.WithLabelValues("get").Observe(time.Since(start).Seconds())
-	case "HEAD":
-		stats.FilerRequestCounter.WithLabelValues("head").Inc()
-		fs.GetOrHeadHandler(w, r)
-		stats.FilerRequestHistogram.WithLabelValues("head").Observe(time.Since(start).Seconds())
+	default:
+		requestMethod = "INVALID"
+		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
 }
 
 func OptionsHandler(w http.ResponseWriter, r *http.Request, isReadOnly bool) {
 	if isReadOnly {
-		w.Header().Add("Access-Control-Allow-Methods", "GET, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
 	} else {
-		w.Header().Add("Access-Control-Allow-Methods", "PUT, POST, GET, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Methods", "PUT, POST, GET, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Expose-Headers", "*")
 	}
-	w.Header().Add("Access-Control-Allow-Headers", "*")
+	w.Header().Set("Access-Control-Allow-Headers", "*")
+	w.Header().Set("Access-Control-Allow-Credentials", "true")
 }
 
 // maybeCheckJwtAuthorization returns true if access should be granted, false if it should be denied
@@ -174,5 +225,15 @@ func (fs *FilerServer) maybeCheckJwtAuthorization(r *http.Request, isWrite bool)
 		return false
 	} else {
 		return true
+	}
+}
+
+func (fs *FilerServer) filerHealthzHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Server", "SeaweedFS "+util.VERSION)
+	if _, err := fs.filer.Store.FindEntry(context.Background(), filer.TopicsDir); err != nil && err != filer_pb.ErrNotFound {
+		glog.Warningf("filerHealthzHandler FindEntry: %+v", err)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	} else {
+		w.WriteHeader(http.StatusOK)
 	}
 }

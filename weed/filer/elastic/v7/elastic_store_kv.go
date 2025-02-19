@@ -1,14 +1,17 @@
+//go:build elastic
+// +build elastic
+
 package elastic
 
 import (
 	"context"
 	"fmt"
 
-	"github.com/chrislusf/seaweedfs/weed/filer"
+	"github.com/seaweedfs/seaweedfs/weed/filer"
 
-	"github.com/chrislusf/seaweedfs/weed/glog"
 	jsoniter "github.com/json-iterator/go"
 	elastic "github.com/olivere/elastic/v7"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
 )
 
 func (store *ElasticStore) KvDelete(ctx context.Context, key []byte) (err error) {
@@ -23,7 +26,7 @@ func (store *ElasticStore) KvDelete(ctx context.Context, key []byte) (err error)
 		}
 	}
 	glog.Errorf("delete key(id:%s) %v.", string(key), err)
-	return fmt.Errorf("delete key %v.", err)
+	return fmt.Errorf("delete key %v", err)
 }
 
 func (store *ElasticStore) KvGet(ctx context.Context, key []byte) (value []byte, err error) {
@@ -50,7 +53,7 @@ func (store *ElasticStore) KvPut(ctx context.Context, key []byte, value []byte) 
 	val, err := jsoniter.Marshal(esEntry)
 	if err != nil {
 		glog.Errorf("insert key(%s) %v.", string(key), err)
-		return fmt.Errorf("insert key %v.", err)
+		return fmt.Errorf("insert key %v", err)
 	}
 	_, err = store.client.Index().
 		Index(indexKV).

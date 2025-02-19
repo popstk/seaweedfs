@@ -1,9 +1,9 @@
 package topology
 
 import (
-	"github.com/chrislusf/seaweedfs/weed/storage/erasure_coding"
-	"github.com/chrislusf/seaweedfs/weed/storage/needle"
-	"github.com/chrislusf/seaweedfs/weed/storage/types"
+	"github.com/seaweedfs/seaweedfs/weed/storage/erasure_coding"
+	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
+	"github.com/seaweedfs/seaweedfs/weed/storage/types"
 )
 
 func (d *Disk) GetEcShards() (ret []*erasure_coding.EcVolumeInfo) {
@@ -29,10 +29,12 @@ func (d *Disk) AddOrUpdateEcShard(s *erasure_coding.EcVolumeInfo) {
 		delta = existing.ShardBits.ShardIdCount() - oldCount
 	}
 
-	deltaDiskUsages := newDiskUsages()
-	deltaDiskUsage := deltaDiskUsages.getOrCreateDisk(types.ToDiskType(string(d.Id())))
-	deltaDiskUsage.ecShardCount = int64(delta)
-	d.UpAdjustDiskUsageDelta(deltaDiskUsages)
+	if delta == 0 {
+		return
+	}
+	d.UpAdjustDiskUsageDelta(types.ToDiskType(string(d.Id())), &DiskUsageCounts{
+		ecShardCount: int64(delta),
+	})
 
 }
 
@@ -45,10 +47,11 @@ func (d *Disk) DeleteEcShard(s *erasure_coding.EcVolumeInfo) {
 		existing.ShardBits = existing.ShardBits.Minus(s.ShardBits)
 		delta := existing.ShardBits.ShardIdCount() - oldCount
 
-		deltaDiskUsages := newDiskUsages()
-		deltaDiskUsage := deltaDiskUsages.getOrCreateDisk(types.ToDiskType(string(d.Id())))
-		deltaDiskUsage.ecShardCount = int64(delta)
-		d.UpAdjustDiskUsageDelta(deltaDiskUsages)
+		if delta != 0 {
+			d.UpAdjustDiskUsageDelta(types.ToDiskType(string(d.Id())), &DiskUsageCounts{
+				ecShardCount: int64(delta),
+			})
+		}
 
 		if existing.ShardBits.ShardIdCount() == 0 {
 			delete(d.ecShards, s.VolumeId)

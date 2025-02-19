@@ -29,6 +29,13 @@ func (fp FullPath) Name() string {
 	return name
 }
 
+func (fp FullPath) IsLongerFileName(maxFilenameLength uint32) bool {
+	if maxFilenameLength == 0 {
+		return false
+	}
+	return uint32(len([]byte(fp.Name()))) > maxFilenameLength
+}
+
 func (fp FullPath) Child(name string) FullPath {
 	dir := string(fp)
 	noPrefix := name
@@ -62,4 +69,18 @@ func Join(names ...string) string {
 
 func JoinPath(names ...string) FullPath {
 	return FullPath(Join(names...))
+}
+
+func (fp FullPath) IsUnder(other FullPath) bool {
+	if other == "/" {
+		return true
+	}
+	return strings.HasPrefix(string(fp), string(other)+"/")
+}
+
+func StringSplit(separatedValues string, sep string) []string {
+	if separatedValues == "" {
+		return nil
+	}
+	return strings.Split(separatedValues, sep)
 }

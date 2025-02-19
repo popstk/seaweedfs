@@ -2,11 +2,11 @@ package topology
 
 import (
 	"fmt"
-	"github.com/chrislusf/seaweedfs/weed/storage/types"
+	"github.com/seaweedfs/seaweedfs/weed/storage/types"
 
-	"github.com/chrislusf/seaweedfs/weed/storage/needle"
-	"github.com/chrislusf/seaweedfs/weed/storage/super_block"
-	"github.com/chrislusf/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
+	"github.com/seaweedfs/seaweedfs/weed/storage/super_block"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
 type Collection struct {
@@ -42,6 +42,28 @@ func (c *Collection) GetOrCreateVolumeLayout(rp *super_block.ReplicaPlacement, t
 		return NewVolumeLayout(rp, ttl, diskType, c.volumeSizeLimit, c.replicationAsMin)
 	})
 	return vl.(*VolumeLayout)
+}
+
+func (c *Collection) GetVolumeLayout(rp *super_block.ReplicaPlacement, ttl *needle.TTL, diskType types.DiskType) (*VolumeLayout, bool) {
+	keyString := rp.String()
+	if ttl != nil {
+		keyString += ttl.String()
+	}
+	if diskType != types.HardDriveType {
+		keyString += string(diskType)
+	}
+	vl, ok := c.storageType2VolumeLayout.Find(keyString)
+	return vl.(*VolumeLayout), ok
+}
+
+func (c *Collection) GetAllVolumeLayouts() []*VolumeLayout {
+	var vls []*VolumeLayout
+	for _, vl := range c.storageType2VolumeLayout.Items() {
+		if vl != nil {
+			vls = append(vls, vl.(*VolumeLayout))
+		}
+	}
+	return vls
 }
 
 func (c *Collection) DeleteVolumeLayout(rp *super_block.ReplicaPlacement, ttl *needle.TTL, diskType types.DiskType) {
