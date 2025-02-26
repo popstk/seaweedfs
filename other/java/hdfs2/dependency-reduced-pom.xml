@@ -1,15 +1,31 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/maven-v4_0_0.xsd">
-  <parent>
-    <artifactId>oss-parent</artifactId>
-    <groupId>org.sonatype.oss</groupId>
-    <version>9</version>
-    <relativePath>../pom.xml/pom.xml</relativePath>
-  </parent>
   <modelVersion>4.0.0</modelVersion>
-  <groupId>com.github.chrislusf</groupId>
+  <groupId>com.seaweedfs</groupId>
   <artifactId>seaweedfs-hadoop2-client</artifactId>
+  <name>SeaweedFS HDFS2 Client</name>
   <version>${seaweedfs.client.version}</version>
+  <description>A java client for SeaweedFS.</description>
+  <url>https://github.com/seaweedfs/seaweedfs</url>
+  <developers>
+    <developer>
+      <name>Chris Lu</name>
+      <email>chris.lu@gmail.com</email>
+      <organization>SeaweedFS</organization>
+      <organizationUrl>https://seaweedfs.com</organizationUrl>
+    </developer>
+  </developers>
+  <licenses>
+    <license>
+      <name>The Apache License, Version 2.0</name>
+      <url>http://www.apache.org/licenses/LICENSE-2.0.txt</url>
+    </license>
+  </licenses>
+  <scm>
+    <connection>scm:git:git://github.com/seaweedfs/seaweedfs.git</connection>
+    <developerConnection>scm:git:ssh://github.com:seaweedfs/seaweedfs.git</developerConnection>
+    <url>https://github.com/seaweedfs/seaweedfs/tree/master</url>
+  </scm>
   <build>
     <plugins>
       <plugin>
@@ -17,6 +33,7 @@
         <configuration>
           <source>8</source>
           <target>8</target>
+          <release>8</release>
         </configuration>
       </plugin>
       <plugin>
@@ -84,14 +101,13 @@
         </executions>
       </plugin>
       <plugin>
-        <groupId>org.sonatype.plugins</groupId>
-        <artifactId>nexus-staging-maven-plugin</artifactId>
-        <version>1.6.8</version>
+        <groupId>org.sonatype.central</groupId>
+        <artifactId>central-publishing-maven-plugin</artifactId>
+        <version>0.5.0</version>
         <extensions>true</extensions>
         <configuration>
-          <serverId>ossrh</serverId>
-          <nexusUrl>https://oss.sonatype.org/</nexusUrl>
-          <autoReleaseAfterClose>true</autoReleaseAfterClose>
+          <publishingServerId>central</publishingServerId>
+          <autoPublish>true</autoPublish>
         </configuration>
       </plugin>
       <plugin>
@@ -108,7 +124,7 @@
       </plugin>
       <plugin>
         <artifactId>maven-javadoc-plugin</artifactId>
-        <version>2.9.1</version>
+        <version>3.0.1</version>
         <executions>
           <execution>
             <id>attach-javadocs</id>
@@ -124,7 +140,7 @@
     <dependency>
       <groupId>org.apache.hadoop</groupId>
       <artifactId>hadoop-client</artifactId>
-      <version>2.9.2</version>
+      <version>3.2.4</version>
       <scope>provided</scope>
       <exclusions>
         <exclusion>
@@ -132,11 +148,11 @@
           <groupId>org.apache.hadoop</groupId>
         </exclusion>
         <exclusion>
-          <artifactId>hadoop-mapreduce-client-app</artifactId>
+          <artifactId>hadoop-yarn-api</artifactId>
           <groupId>org.apache.hadoop</groupId>
         </exclusion>
         <exclusion>
-          <artifactId>hadoop-yarn-api</artifactId>
+          <artifactId>hadoop-yarn-client</artifactId>
           <groupId>org.apache.hadoop</groupId>
         </exclusion>
         <exclusion>
@@ -156,7 +172,7 @@
     <dependency>
       <groupId>org.apache.hadoop</groupId>
       <artifactId>hadoop-common</artifactId>
-      <version>2.9.2</version>
+      <version>3.2.4</version>
       <scope>provided</scope>
       <exclusions>
         <exclusion>
@@ -166,10 +182,6 @@
         <exclusion>
           <artifactId>commons-math3</artifactId>
           <groupId>org.apache.commons</groupId>
-        </exclusion>
-        <exclusion>
-          <artifactId>xmlenc</artifactId>
-          <groupId>xmlenc</groupId>
         </exclusion>
         <exclusion>
           <artifactId>commons-io</artifactId>
@@ -184,20 +196,28 @@
           <groupId>commons-collections</groupId>
         </exclusion>
         <exclusion>
-          <artifactId>servlet-api</artifactId>
+          <artifactId>javax.servlet-api</artifactId>
           <groupId>javax.servlet</groupId>
         </exclusion>
         <exclusion>
-          <artifactId>jetty</artifactId>
-          <groupId>org.mortbay.jetty</groupId>
+          <artifactId>javax.activation-api</artifactId>
+          <groupId>javax.activation</groupId>
+        </exclusion>
+        <exclusion>
+          <artifactId>jetty-server</artifactId>
+          <groupId>org.eclipse.jetty</groupId>
         </exclusion>
         <exclusion>
           <artifactId>jetty-util</artifactId>
-          <groupId>org.mortbay.jetty</groupId>
+          <groupId>org.eclipse.jetty</groupId>
         </exclusion>
         <exclusion>
-          <artifactId>jetty-sslengine</artifactId>
-          <groupId>org.mortbay.jetty</groupId>
+          <artifactId>jetty-servlet</artifactId>
+          <groupId>org.eclipse.jetty</groupId>
+        </exclusion>
+        <exclusion>
+          <artifactId>jetty-webapp</artifactId>
+          <groupId>org.eclipse.jetty</groupId>
         </exclusion>
         <exclusion>
           <artifactId>jsp-api</artifactId>
@@ -205,6 +225,10 @@
         </exclusion>
         <exclusion>
           <artifactId>jersey-core</artifactId>
+          <groupId>com.sun.jersey</groupId>
+        </exclusion>
+        <exclusion>
+          <artifactId>jersey-servlet</artifactId>
           <groupId>com.sun.jersey</groupId>
         </exclusion>
         <exclusion>
@@ -216,40 +240,36 @@
           <groupId>com.sun.jersey</groupId>
         </exclusion>
         <exclusion>
-          <artifactId>log4j</artifactId>
-          <groupId>log4j</groupId>
+          <artifactId>reload4j</artifactId>
+          <groupId>ch.qos.reload4j</groupId>
         </exclusion>
         <exclusion>
-          <artifactId>jets3t</artifactId>
-          <groupId>net.java.dev.jets3t</groupId>
+          <artifactId>commons-beanutils</artifactId>
+          <groupId>commons-beanutils</groupId>
         </exclusion>
         <exclusion>
-          <artifactId>commons-lang</artifactId>
-          <groupId>commons-lang</groupId>
-        </exclusion>
-        <exclusion>
-          <artifactId>commons-configuration</artifactId>
-          <groupId>commons-configuration</groupId>
+          <artifactId>commons-configuration2</artifactId>
+          <groupId>org.apache.commons</groupId>
         </exclusion>
         <exclusion>
           <artifactId>commons-lang3</artifactId>
           <groupId>org.apache.commons</groupId>
         </exclusion>
         <exclusion>
-          <artifactId>slf4j-log4j12</artifactId>
+          <artifactId>commons-text</artifactId>
+          <groupId>org.apache.commons</groupId>
+        </exclusion>
+        <exclusion>
+          <artifactId>slf4j-reload4j</artifactId>
           <groupId>org.slf4j</groupId>
-        </exclusion>
-        <exclusion>
-          <artifactId>jackson-core-asl</artifactId>
-          <groupId>org.codehaus.jackson</groupId>
-        </exclusion>
-        <exclusion>
-          <artifactId>jackson-mapper-asl</artifactId>
-          <groupId>org.codehaus.jackson</groupId>
         </exclusion>
         <exclusion>
           <artifactId>avro</artifactId>
           <groupId>org.apache.avro</groupId>
+        </exclusion>
+        <exclusion>
+          <artifactId>re2j</artifactId>
+          <groupId>com.google.re2j</groupId>
         </exclusion>
         <exclusion>
           <artifactId>hadoop-auth</artifactId>
@@ -280,6 +300,14 @@
           <groupId>org.apache.commons</groupId>
         </exclusion>
         <exclusion>
+          <artifactId>kerb-simplekdc</artifactId>
+          <groupId>org.apache.kerby</groupId>
+        </exclusion>
+        <exclusion>
+          <artifactId>jackson-databind</artifactId>
+          <groupId>com.fasterxml.jackson.core</groupId>
+        </exclusion>
+        <exclusion>
           <artifactId>stax2-api</artifactId>
           <groupId>org.codehaus.woodstox</groupId>
         </exclusion>
@@ -288,20 +316,18 @@
           <groupId>com.fasterxml.woodstox</groupId>
         </exclusion>
         <exclusion>
+          <artifactId>dnsjava</artifactId>
+          <groupId>dnsjava</groupId>
+        </exclusion>
+        <exclusion>
           <artifactId>hadoop-annotations</artifactId>
           <groupId>org.apache.hadoop</groupId>
         </exclusion>
       </exclusions>
     </dependency>
   </dependencies>
-  <distributionManagement>
-    <snapshotRepository>
-      <id>ossrh</id>
-      <url>https://oss.sonatype.org/content/repositories/snapshots</url>
-    </snapshotRepository>
-  </distributionManagement>
   <properties>
-    <seaweedfs.client.version>2.85</seaweedfs.client.version>
-    <hadoop.version>2.9.2</hadoop.version>
+    <seaweedfs.client.version>3.80</seaweedfs.client.version>
+    <hadoop.version>3.2.4</hadoop.version>
   </properties>
 </project>

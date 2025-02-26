@@ -4,10 +4,10 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"github.com/chrislusf/seaweedfs/weed/pb/master_pb"
+	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
 	"io"
 
-	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 )
 
 func init() {
@@ -26,6 +26,10 @@ func (c *commandS3BucketDelete) Help() string {
 
 	s3.bucket.delete -name <bucket_name>
 `
+}
+
+func (c *commandS3BucketDelete) HasTag(CommandTag) bool {
+	return false
 }
 
 func (c *commandS3BucketDelete) Do(args []string, commandEnv *CommandEnv, writer io.Writer) (err error) {
@@ -54,7 +58,7 @@ func (c *commandS3BucketDelete) Do(args []string, commandEnv *CommandEnv, writer
 	// delete the collection directly first
 	err = commandEnv.MasterClient.WithClient(false, func(client master_pb.SeaweedClient) error {
 		_, err = client.CollectionDelete(context.Background(), &master_pb.CollectionDeleteRequest{
-			Name: *bucketName,
+			Name: getCollectionName(commandEnv, *bucketName),
 		})
 		return err
 	})

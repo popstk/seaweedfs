@@ -3,23 +3,23 @@ package storage
 import (
 	"context"
 	"fmt"
-	"github.com/chrislusf/seaweedfs/weed/pb"
 	"io"
 	"os"
-	"sort"
+	"slices"
 	"sync"
 	"time"
 
 	"github.com/klauspost/reedsolomon"
 
-	"github.com/chrislusf/seaweedfs/weed/glog"
-	"github.com/chrislusf/seaweedfs/weed/operation"
-	"github.com/chrislusf/seaweedfs/weed/pb/master_pb"
-	"github.com/chrislusf/seaweedfs/weed/pb/volume_server_pb"
-	"github.com/chrislusf/seaweedfs/weed/stats"
-	"github.com/chrislusf/seaweedfs/weed/storage/erasure_coding"
-	"github.com/chrislusf/seaweedfs/weed/storage/needle"
-	"github.com/chrislusf/seaweedfs/weed/storage/types"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/operation"
+	"github.com/seaweedfs/seaweedfs/weed/pb"
+	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
+	"github.com/seaweedfs/seaweedfs/weed/pb/volume_server_pb"
+	"github.com/seaweedfs/seaweedfs/weed/stats"
+	"github.com/seaweedfs/seaweedfs/weed/storage/erasure_coding"
+	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
+	"github.com/seaweedfs/seaweedfs/weed/storage/types"
 )
 
 func (s *Store) CollectErasureCodingHeartbeat() *master_pb.Heartbeat {
@@ -50,7 +50,7 @@ func (s *Store) CollectErasureCodingHeartbeat() *master_pb.Heartbeat {
 
 func (s *Store) MountEcShards(collection string, vid needle.VolumeId, shardId erasure_coding.ShardId) error {
 	for _, location := range s.Locations {
-		if err := location.LoadEcShard(collection, vid, shardId); err == nil {
+		if ecVolume, err := location.LoadEcShard(collection, vid, shardId); err == nil {
 			glog.V(0).Infof("MountEcShards %d.%d", vid, shardId)
 
 			var shardBits erasure_coding.ShardBits
@@ -60,6 +60,7 @@ func (s *Store) MountEcShards(collection string, vid needle.VolumeId, shardId er
 				Collection:  collection,
 				EcIndexBits: uint32(shardBits.AddShardId(shardId)),
 				DiskType:    string(location.DiskType),
+				ExpireAtSec: ecVolume.ExpireAtSec,
 			}
 			return nil
 		} else if err == os.ErrNotExist {
@@ -114,6 +115,17 @@ func (s *Store) FindEcVolume(vid needle.VolumeId) (*erasure_coding.EcVolume, boo
 		}
 	}
 	return nil, false
+}
+
+// shardFiles is a list of shard files, which is used to return the shard locations
+func (s *Store) CollectEcShards(vid needle.VolumeId, shardFileNames []string) (ecVolume *erasure_coding.EcVolume, found bool) {
+	for _, location := range s.Locations {
+		if s, foundShards := location.CollectEcShards(vid, shardFileNames); foundShards {
+			ecVolume = s
+			found = true
+		}
+	}
+	return
 }
 
 func (s *Store) DestroyEcVolume(vid needle.VolumeId) {
@@ -189,9 +201,12 @@ func (s *Store) readOneEcShardInterval(needleId types.NeedleId, ecVolume *erasur
 	shardId, actualOffset := interval.ToShardIdAndOffset(erasure_coding.ErasureCodingLargeBlockSize, erasure_coding.ErasureCodingSmallBlockSize)
 	data = make([]byte, interval.Size)
 	if shard, found := ecVolume.FindEcVolumeShard(shardId); found {
-		if _, err = shard.ReadAt(data, actualOffset); err != nil {
-			glog.V(0).Infof("read local ec shard %d.%d offset %d: %v", ecVolume.VolumeId, shardId, actualOffset, err)
-			return
+		var readSize int
+		if readSize, err = shard.ReadAt(data, actualOffset); err != nil {
+			if readSize != int(interval.Size) {
+				glog.V(0).Infof("read local ec shard %d.%d offset %d: %v", ecVolume.VolumeId, shardId, actualOffset, err)
+				return
+			}
 		}
 	} else {
 		ecVolume.ShardLocationsLock.RLock()
@@ -339,7 +354,7 @@ func (s *Store) recoverOneRemoteEcShardInterval(needleId types.NeedleId, ecVolum
 	ecVolume.ShardLocationsLock.RLock()
 	for shardId, locations := range ecVolume.ShardLocations {
 
-		// skip currnent shard or empty shard
+		// skip current shard or empty shard
 		if shardId == shardIdToRecover {
 			continue
 		}
@@ -389,8 +404,8 @@ func (s *Store) EcVolumes() (ecVolumes []*erasure_coding.EcVolume) {
 		}
 		location.ecVolumesLock.RUnlock()
 	}
-	sort.Slice(ecVolumes, func(i, j int) bool {
-		return ecVolumes[i].VolumeId > ecVolumes[j].VolumeId
+	slices.SortFunc(ecVolumes, func(a, b *erasure_coding.EcVolume) int {
+		return int(a.VolumeId) - int(b.VolumeId)
 	})
 	return ecVolumes
 }

@@ -3,18 +3,19 @@ package storage
 import (
 	"context"
 	"fmt"
-	"github.com/chrislusf/seaweedfs/weed/pb"
 	"io"
 	"os"
 
+	"github.com/seaweedfs/seaweedfs/weed/pb"
+
 	"google.golang.org/grpc"
 
-	"github.com/chrislusf/seaweedfs/weed/operation"
-	"github.com/chrislusf/seaweedfs/weed/pb/volume_server_pb"
-	"github.com/chrislusf/seaweedfs/weed/storage/idx"
-	"github.com/chrislusf/seaweedfs/weed/storage/needle"
-	"github.com/chrislusf/seaweedfs/weed/storage/super_block"
-	. "github.com/chrislusf/seaweedfs/weed/storage/types"
+	"github.com/seaweedfs/seaweedfs/weed/operation"
+	"github.com/seaweedfs/seaweedfs/weed/pb/volume_server_pb"
+	"github.com/seaweedfs/seaweedfs/weed/storage/idx"
+	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
+	"github.com/seaweedfs/seaweedfs/weed/storage/super_block"
+	. "github.com/seaweedfs/seaweedfs/weed/storage/types"
 )
 
 func (v *Volume) GetVolumeSyncStatus() *volume_server_pb.VolumeSyncStatusResponse {
@@ -200,7 +201,7 @@ func (v *Volume) BinarySearchByAppendAtNs(sinceNs uint64) (offset Offset, isLast
 				err = leftErr
 				return
 			}
-			rightIndex, rightOffset, rightNs, rightErr := v.readRightNs(m)
+			rightIndex, rightOffset, rightNs, rightErr := v.readRightNs(m, entryCount)
 			if rightErr != nil {
 				err = rightErr
 				return
@@ -226,7 +227,7 @@ func (v *Volume) BinarySearchByAppendAtNs(sinceNs uint64) (offset Offset, isLast
 
 		mNs, nsReadErr := v.readAppendAtNs(offset)
 		if nsReadErr != nil {
-			err = fmt.Errorf("read entry %d offset %d: %v", m, offset, nsReadErr)
+			err = fmt.Errorf("read entry %d offset %d: %v", m, offset.ToActualOffset(), nsReadErr)
 			return
 		}
 
@@ -249,13 +250,16 @@ func (v *Volume) BinarySearchByAppendAtNs(sinceNs uint64) (offset Offset, isLast
 
 }
 
-func (v *Volume) readRightNs(m int64) (index int64, offset Offset, ts uint64, err error) {
+func (v *Volume) readRightNs(m, max int64) (index int64, offset Offset, ts uint64, err error) {
 	index = m
 	for offset.IsZero() {
 		index++
+		if index >= max {
+			return
+		}
 		offset, err = v.readOffsetFromIndex(index)
 		if err != nil {
-			err = fmt.Errorf("read entry %d: %v", index, err)
+			err = fmt.Errorf("read left entry at %d: %v", index, err)
 			return
 		}
 	}
@@ -269,9 +273,12 @@ func (v *Volume) readLeftNs(m int64) (index int64, offset Offset, ts uint64, err
 	index = m
 	for offset.IsZero() {
 		index--
+		if index < 0 {
+			return
+		}
 		offset, err = v.readOffsetFromIndex(index)
 		if err != nil {
-			err = fmt.Errorf("read entry %d: %v", index, err)
+			err = fmt.Errorf("read right entry at %d: %v", index, err)
 			return
 		}
 	}

@@ -2,12 +2,14 @@ package mount
 
 import (
 	"context"
-	"github.com/chrislusf/seaweedfs/weed/filer"
-	"github.com/chrislusf/seaweedfs/weed/glog"
-	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
-	"github.com/hanwen/go-fuse/v2/fuse"
 	"syscall"
 	"time"
+
+	"github.com/hanwen/go-fuse/v2/fuse"
+
+	"github.com/seaweedfs/seaweedfs/weed/filer"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 )
 
 /*
@@ -23,7 +25,6 @@ When creating a link:
 
 /** Create a hard link to a file */
 func (wfs *WFS) Link(cancel <-chan struct{}, in *fuse.LinkIn, name string, out *fuse.EntryOut) (code fuse.Status) {
-
 	if wfs.IsOverQuota {
 		return fuse.Status(syscall.ENOSPC)
 	}
@@ -47,6 +48,11 @@ func (wfs *WFS) Link(cancel <-chan struct{}, in *fuse.LinkIn, name string, out *
 		return status
 	}
 
+	// hardlink is not allowed in WORM mode
+	if wormEnforced, _ := wfs.wormEnforcedForEntry(oldEntryPath, oldEntry); wormEnforced {
+		return fuse.EPERM
+	}
+
 	// update old file to hardlink mode
 	if len(oldEntry.HardLinkId) == 0 {
 		oldEntry.HardLinkId = filer.NewHardLinkId()
@@ -67,12 +73,13 @@ func (wfs *WFS) Link(cancel <-chan struct{}, in *fuse.LinkIn, name string, out *
 			Name:            name,
 			IsDirectory:     false,
 			Attributes:      oldEntry.Attributes,
-			Chunks:          oldEntry.Chunks,
+			Chunks:          oldEntry.GetChunks(),
 			Extended:        oldEntry.Extended,
 			HardLinkId:      oldEntry.HardLinkId,
 			HardLinkCounter: oldEntry.HardLinkCounter,
 		},
-		Signatures: []int32{wfs.signature},
+		Signatures:               []int32{wfs.signature},
+		SkipCheckParentDirectory: true,
 	}
 
 	// apply changes to the filer, and also apply to local metaCache
@@ -102,9 +109,9 @@ func (wfs *WFS) Link(cancel <-chan struct{}, in *fuse.LinkIn, name string, out *
 		return fuse.EIO
 	}
 
-	inode := wfs.inodeToPath.Lookup(newEntryPath, oldEntry.Attributes.Crtime, oldEntry.IsDirectory, true, oldEntry.Attributes.Inode, true)
+	wfs.inodeToPath.AddPath(oldEntry.Attributes.Inode, newEntryPath)
 
-	wfs.outputPbEntry(out, inode, request.Entry)
+	wfs.outputPbEntry(out, oldEntry.Attributes.Inode, request.Entry)
 
 	return fuse.OK
 }

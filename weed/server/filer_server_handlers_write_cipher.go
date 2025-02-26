@@ -8,12 +8,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/chrislusf/seaweedfs/weed/filer"
-	"github.com/chrislusf/seaweedfs/weed/glog"
-	"github.com/chrislusf/seaweedfs/weed/operation"
-	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
-	"github.com/chrislusf/seaweedfs/weed/storage/needle"
-	"github.com/chrislusf/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/filer"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/operation"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
 // handling single chunk POST or PUT upload
@@ -53,13 +53,19 @@ func (fs *FilerServer) encrypt(ctx context.Context, w http.ResponseWriter, r *ht
 		PairMap:           pu.PairMap,
 		Jwt:               auth,
 	}
-	uploadResult, uploadError := operation.UploadData(uncompressedData, uploadOption)
+
+	uploader, uploaderErr := operation.NewUploader()
+	if uploaderErr != nil {
+		return nil, fmt.Errorf("uploader initialization error: %v", uploaderErr)
+	}
+
+	uploadResult, uploadError := uploader.UploadData(uncompressedData, uploadOption)
 	if uploadError != nil {
 		return nil, fmt.Errorf("upload to volume server: %v", uploadError)
 	}
 
 	// Save to chunk manifest structure
-	fileChunks := []*filer_pb.FileChunk{uploadResult.ToPbFileChunk(fileId, 0)}
+	fileChunks := []*filer_pb.FileChunk{uploadResult.ToPbFileChunk(fileId, 0, time.Now().UnixNano())}
 
 	// fmt.Printf("uploaded: %+v\n", uploadResult)
 
@@ -73,17 +79,14 @@ func (fs *FilerServer) encrypt(ctx context.Context, w http.ResponseWriter, r *ht
 	entry := &filer.Entry{
 		FullPath: util.FullPath(path),
 		Attr: filer.Attr{
-			Mtime:       time.Now(),
-			Crtime:      time.Now(),
-			Mode:        0660,
-			Uid:         OS_UID,
-			Gid:         OS_GID,
-			Replication: so.Replication,
-			Collection:  so.Collection,
-			TtlSec:      so.TtlSeconds,
-			DiskType:    so.DiskType,
-			Mime:        pu.MimeType,
-			Md5:         util.Base64Md5ToBytes(pu.ContentMd5),
+			Mtime:  time.Now(),
+			Crtime: time.Now(),
+			Mode:   0660,
+			Uid:    OS_UID,
+			Gid:    OS_GID,
+			TtlSec: so.TtlSeconds,
+			Mime:   pu.MimeType,
+			Md5:    util.Base64Md5ToBytes(pu.ContentMd5),
 		},
 		Chunks: fileChunks,
 	}
@@ -93,8 +96,8 @@ func (fs *FilerServer) encrypt(ctx context.Context, w http.ResponseWriter, r *ht
 		Size: int64(pu.OriginalDataSize),
 	}
 
-	if dbErr := fs.filer.CreateEntry(ctx, entry, false, false, nil, false); dbErr != nil {
-		fs.filer.DeleteChunks(entry.Chunks)
+	if dbErr := fs.filer.CreateEntry(ctx, entry, false, false, nil, false, so.MaxFileNameLength); dbErr != nil {
+		fs.filer.DeleteUncommittedChunks(entry.GetChunks())
 		err = dbErr
 		filerResult.Error = dbErr.Error()
 		return

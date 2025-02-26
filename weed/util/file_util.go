@@ -1,15 +1,19 @@
 package util
 
 import (
+	"bytes"
+	"crypto/sha256"
 	"errors"
+	"fmt"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"os"
 	"os/user"
 	"path/filepath"
 	"strings"
 	"time"
-
-	"github.com/chrislusf/seaweedfs/weed/glog"
 )
+
+const maxFilenameLength = 255
 
 func TestFolderWritable(folder string) (err error) {
 	fileInfo, err := os.Stat(folder)
@@ -42,6 +46,16 @@ func FileExists(filename string) bool {
 		return false
 	}
 	return true
+
+}
+
+func FolderExists(folder string) bool {
+
+	fileInfo, err := os.Stat(folder)
+	if err != nil {
+		return false
+	}
+	return fileInfo.IsDir()
 
 }
 
@@ -94,6 +108,19 @@ func FileNameBase(filename string) string {
 		return filename
 	}
 	return filename[:lastDotIndex]
+}
+
+func ToShortFileName(path string) string {
+	fileName := filepath.Base(path)
+	if fileNameBytes := []byte(fileName); len(fileNameBytes) > maxFilenameLength {
+		shaStr := fmt.Sprintf("%x", sha256.Sum256(fileNameBytes))
+		fileNameBase := FileNameBase(fileName)
+		fileExt := fileName[len(fileNameBase):]
+		fileNameBaseBates := bytes.ToValidUTF8([]byte(fileNameBase)[:maxFilenameLength-len([]byte(fileExt))-8], []byte{})
+		shortFileName := string(fileNameBaseBates) + shaStr[len(shaStr)-8:]
+		return filepath.Join(filepath.Dir(path), shortFileName) + fileExt
+	}
+	return path
 }
 
 // Copied from os.WriteFile(), adding file sync.

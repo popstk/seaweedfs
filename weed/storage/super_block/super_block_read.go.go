@@ -3,21 +3,23 @@ package super_block
 import (
 	"fmt"
 
-	"github.com/golang/protobuf/proto"
+	"google.golang.org/protobuf/proto"
 
-	"github.com/chrislusf/seaweedfs/weed/pb/master_pb"
-	"github.com/chrislusf/seaweedfs/weed/storage/backend"
-	"github.com/chrislusf/seaweedfs/weed/storage/needle"
-	"github.com/chrislusf/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
+	"github.com/seaweedfs/seaweedfs/weed/storage/backend"
+	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
 // ReadSuperBlock reads from data file and load it into volume's super block
 func ReadSuperBlock(datBackend backend.BackendStorageFile) (superBlock SuperBlock, err error) {
 
 	header := make([]byte, SuperBlockSize)
-	if _, e := datBackend.ReadAt(header, 0); e != nil {
-		err = fmt.Errorf("cannot read volume %s super block: %v", datBackend.Name(), e)
-		return
+	if n, e := datBackend.ReadAt(header, 0); e != nil {
+		if n != SuperBlockSize {
+			err = fmt.Errorf("cannot read volume %s super block: %v", datBackend.Name(), e)
+			return
+		}
 	}
 
 	superBlock.Version = needle.Version(header[0])

@@ -7,13 +7,13 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
-	"github.com/chrislusf/seaweedfs/weed/glog"
-	"github.com/chrislusf/seaweedfs/weed/pb"
-	"github.com/chrislusf/seaweedfs/weed/pb/master_pb"
-	"github.com/chrislusf/seaweedfs/weed/security"
-	weed_server "github.com/chrislusf/seaweedfs/weed/server"
-	"github.com/chrislusf/seaweedfs/weed/util"
 	"github.com/gorilla/mux"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/pb"
+	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
+	"github.com/seaweedfs/seaweedfs/weed/security"
+	weed_server "github.com/seaweedfs/seaweedfs/weed/server"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 	"google.golang.org/grpc/reflection"
 )
 
@@ -52,7 +52,7 @@ var cmdMasterFollower = &Command{
 	In most cases, the master follower is not needed. In big data centers with thousands of volume
 	servers. In theory, the master may have trouble to keep up with the write requests and read requests.
 
-	The master follower can relieve the master from from read requests, which only needs to
+	The master follower can relieve the master from read requests, which only needs to
 	lookup a fileId or volumeId.
 
 	The master follower currently can handle fileId lookup requests:
@@ -68,7 +68,7 @@ var cmdMasterFollower = &Command{
 
 func runMasterFollower(cmd *Command, args []string) bool {
 
-	util.LoadConfiguration("security", false)
+	util.LoadSecurityConfiguration()
 	util.LoadConfiguration("master", false)
 
 	if *mf.portGrpc == 0 {
@@ -83,7 +83,7 @@ func runMasterFollower(cmd *Command, args []string) bool {
 func startMasterFollower(masterOptions MasterOptions) {
 
 	// collect settings from main masters
-	masters := pb.ServerAddresses(*mf.peers).ToAddresses()
+	masters := pb.ServerAddresses(*mf.peers).ToAddressMap()
 
 	var err error
 	grpcDialOption := security.LoadClientTLS(util.GetViper(), "grpc.master")
@@ -120,7 +120,7 @@ func startMasterFollower(masterOptions MasterOptions) {
 	ms := weed_server.NewMasterServer(r, option, masters)
 	listeningAddress := util.JoinHostPort(*masterOptions.ipBind, *masterOptions.port)
 	glog.V(0).Infof("Start Seaweed Master %s at %s", util.Version(), listeningAddress)
-	masterListener, masterLocalListner, e := util.NewIpAndLocalListeners(*masterOptions.ipBind, *masterOptions.port, 0)
+	masterListener, masterLocalListener, e := util.NewIpAndLocalListeners(*masterOptions.ipBind, *masterOptions.port, 0)
 	if e != nil {
 		glog.Fatalf("Master startup error: %v", e)
 	}
@@ -140,12 +140,12 @@ func startMasterFollower(masterOptions MasterOptions) {
 	}
 	go grpcS.Serve(grpcL)
 
-	go ms.MasterClient.KeepConnectedToMaster()
+	go ms.MasterClient.KeepConnectedToMaster(context.Background())
 
 	// start http server
 	httpS := &http.Server{Handler: r}
-	if masterLocalListner != nil {
-		go httpS.Serve(masterLocalListner)
+	if masterLocalListener != nil {
+		go httpS.Serve(masterLocalListener)
 	}
 	go httpS.Serve(masterListener)
 

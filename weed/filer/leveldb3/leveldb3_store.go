@@ -16,10 +16,10 @@ import (
 	"github.com/syndtr/goleveldb/leveldb/opt"
 	leveldb_util "github.com/syndtr/goleveldb/leveldb/util"
 
-	"github.com/chrislusf/seaweedfs/weed/filer"
-	"github.com/chrislusf/seaweedfs/weed/glog"
-	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
-	weed_util "github.com/chrislusf/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/filer"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	weed_util "github.com/seaweedfs/seaweedfs/weed/util"
 )
 
 const (
@@ -31,9 +31,10 @@ func init() {
 }
 
 type LevelDB3Store struct {
-	dir     string
-	dbs     map[string]*leveldb.DB
-	dbsLock sync.RWMutex
+	dir      string
+	dbs      map[string]*leveldb.DB
+	dbsLock  sync.RWMutex
+	ReadOnly bool
 }
 
 func (store *LevelDB3Store) GetName() string {
@@ -69,12 +70,14 @@ func (store *LevelDB3Store) loadDB(name string) (*leveldb.DB, error) {
 		BlockCacheCapacity: 32 * 1024 * 1024, // default value is 8MiB
 		WriteBuffer:        16 * 1024 * 1024, // default value is 4MiB
 		Filter:             bloom,
+		ReadOnly:           store.ReadOnly,
 	}
 	if name != DEFAULT {
 		opts = &opt.Options{
 			BlockCacheCapacity: 16 * 1024 * 1024, // default value is 8MiB
 			WriteBuffer:        8 * 1024 * 1024,  // default value is 4MiB
 			Filter:             bloom,
+			ReadOnly:           store.ReadOnly,
 		}
 	}
 
@@ -121,23 +124,31 @@ func (store *LevelDB3Store) findDB(fullpath weed_util.FullPath, isForChildren bo
 	}
 
 	store.dbsLock.RUnlock()
-	// upgrade to write lock
+
+	db, err := store.createDB(bucket)
+
+	return db, bucket, shortPath, err
+}
+
+func (store *LevelDB3Store) createDB(bucket string) (*leveldb.DB, error) {
+
 	store.dbsLock.Lock()
 	defer store.dbsLock.Unlock()
 
 	// double check after getting the write lock
 	if db, found := store.dbs[bucket]; found {
-		return db, bucket, shortPath, nil
+		return db, nil
 	}
 
 	// create db
 	db, err := store.loadDB(bucket)
 	if err != nil {
-		return nil, bucket, shortPath, err
+		return nil, err
 	}
+
 	store.dbs[bucket] = db
 
-	return db, bucket, shortPath, nil
+	return db, nil
 }
 
 func (store *LevelDB3Store) closeDB(bucket string) {
@@ -177,7 +188,7 @@ func (store *LevelDB3Store) InsertEntry(ctx context.Context, entry *filer.Entry)
 		return fmt.Errorf("encoding %s %+v: %v", entry.FullPath, entry.Attr, err)
 	}
 
-	if len(entry.Chunks) > 50 {
+	if len(entry.GetChunks()) > filer.CountEntryChunksForGzip {
 		value = weed_util.MaybeGzipData(value)
 	}
 
@@ -187,7 +198,7 @@ func (store *LevelDB3Store) InsertEntry(ctx context.Context, entry *filer.Entry)
 		return fmt.Errorf("persisting %s : %v", entry.FullPath, err)
 	}
 
-	// println("saved", entry.FullPath, "chunks", len(entry.Chunks))
+	// println("saved", entry.FullPath, "chunks", len(entry.GetChunks()))
 
 	return nil
 }
@@ -224,7 +235,7 @@ func (store *LevelDB3Store) FindEntry(ctx context.Context, fullpath weed_util.Fu
 		return entry, fmt.Errorf("decode %s : %v", entry.FullPath, err)
 	}
 
-	// println("read", entry.FullPath, "chunks", len(entry.Chunks), "data", len(data), string(data))
+	// println("read", entry.FullPath, "chunks", len(entry.GetChunks()), "data", len(data), string(data))
 
 	return entry, nil
 }
@@ -328,7 +339,7 @@ func (store *LevelDB3Store) ListDirectoryPrefixedEntries(ctx context.Context, di
 			FullPath: weed_util.NewFullPath(string(dirPath), fileName),
 		}
 
-		// println("list", entry.FullPath, "chunks", len(entry.Chunks))
+		// println("list", entry.FullPath, "chunks", len(entry.GetChunks()))
 		if decodeErr := entry.DecodeAttributesAndChunks(weed_util.MaybeDecompressData(iter.Value())); decodeErr != nil {
 			err = decodeErr
 			glog.V(0).Infof("list %s : %v", entry.FullPath, err)

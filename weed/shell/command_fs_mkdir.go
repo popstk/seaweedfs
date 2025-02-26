@@ -2,8 +2,8 @@ package shell
 
 import (
 	"context"
-	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
-	"github.com/chrislusf/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 	"io"
 	"os"
 	"time"
@@ -25,6 +25,10 @@ func (c *commandFsMkdir) Help() string {
 
 	fs.mkdir path/to/dir
 `
+}
+
+func (c *commandFsMkdir) HasTag(CommandTag) bool {
+	return false
 }
 
 func (c *commandFsMkdir) Do(args []string, commandEnv *CommandEnv, writer io.Writer) (err error) {

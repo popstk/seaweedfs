@@ -6,8 +6,8 @@ import (
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
-	"github.com/chrislusf/seaweedfs/weed/pb/remote_pb"
-	"github.com/chrislusf/seaweedfs/weed/remote_storage"
+	"github.com/seaweedfs/seaweedfs/weed/pb/remote_pb"
+	"github.com/seaweedfs/seaweedfs/weed/remote_storage"
 )
 
 func init() {
@@ -22,11 +22,12 @@ func (s BackBlazeRemoteStorageMaker) HasBucket() bool {
 
 func (s BackBlazeRemoteStorageMaker) Make(conf *remote_pb.RemoteConf) (remote_storage.RemoteStorageClient, error) {
 	client := &s3RemoteStorageClient{
-		conf: conf,
+		supportTagging: false,
+		conf:           conf,
 	}
 	config := &aws.Config{
 		Endpoint:                      aws.String(conf.BackblazeEndpoint),
-		Region:                        aws.String("us-west-002"),
+		Region:                        aws.String(conf.BackblazeRegion),
 		S3ForcePathStyle:              aws.Bool(true),
 		S3DisableContentMD5Validation: aws.Bool(true),
 	}

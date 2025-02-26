@@ -1,35 +1,37 @@
 package mount
 
 import (
-	"github.com/chrislusf/seaweedfs/weed/filer"
-	"github.com/chrislusf/seaweedfs/weed/glog"
-	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
-	"github.com/chrislusf/seaweedfs/weed/util"
-	"io"
-	"sort"
+	"github.com/seaweedfs/seaweedfs/weed/filer"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/util"
+	"os"
 	"sync"
 )
 
 type FileHandleId uint64
 
+var IsDebugFileReadWrite = false
+
 type FileHandle struct {
-	fh           FileHandleId
-	counter      int64
-	entry        *filer_pb.Entry
-	chunkAddLock sync.Mutex
-	inode        uint64
-	wfs          *WFS
+	fh              FileHandleId
+	counter         int64
+	entry           *LockedEntry
+	entryLock       sync.RWMutex
+	entryChunkGroup *filer.ChunkGroup
+	inode           uint64
+	wfs             *WFS
 
 	// cache file has been written to
-	dirtyMetadata  bool
-	dirtyPages     *PageWriter
-	entryViewCache []filer.VisibleInterval
-	reader         io.ReaderAt
-	contentType    string
-	handle         uint64
-	sync.Mutex
+	dirtyMetadata bool
+	dirtyPages    *PageWriter
+	reader        *filer.ChunkReadAt
+	contentType   string
 
 	isDeleted bool
+
+	// for debugging
+	mirrorFile *os.File
 }
 
 func newFileHandle(wfs *WFS, handleId FileHandleId, inode uint64, entry *filer_pb.Entry) *FileHandle {
@@ -41,8 +43,19 @@ func newFileHandle(wfs *WFS, handleId FileHandleId, inode uint64, entry *filer_p
 	}
 	// dirtyPages: newContinuousDirtyPages(file, writeOnly),
 	fh.dirtyPages = newPageWriter(fh, wfs.option.ChunkSizeLimit)
+	fh.entry = &LockedEntry{
+		Entry: entry,
+	}
 	if entry != nil {
-		entry.Attributes.FileSize = filer.FileSize(entry)
+		fh.SetEntry(entry)
+	}
+
+	if IsDebugFileReadWrite {
+		var err error
+		fh.mirrorFile, err = os.OpenFile("/tmp/sw/"+entry.Name, os.O_RDWR|os.O_CREATE, 0600)
+		if err != nil {
+			println("failed to create mirror:", err.Error())
+		}
 	}
 
 	return fh
@@ -53,48 +66,47 @@ func (fh *FileHandle) FullPath() util.FullPath {
 	return fp
 }
 
-func (fh *FileHandle) addChunks(chunks []*filer_pb.FileChunk) {
-
-	// find the earliest incoming chunk
-	newChunks := chunks
-	earliestChunk := newChunks[0]
-	for i := 1; i < len(newChunks); i++ {
-		if lessThan(earliestChunk, newChunks[i]) {
-			earliestChunk = newChunks[i]
-		}
-	}
-
-	if fh.entry == nil {
-		return
-	}
-
-	// pick out-of-order chunks from existing chunks
-	for _, chunk := range fh.entry.Chunks {
-		if lessThan(earliestChunk, chunk) {
-			chunks = append(chunks, chunk)
-		}
-	}
-
-	// sort incoming chunks
-	sort.Slice(chunks, func(i, j int) bool {
-		return lessThan(chunks[i], chunks[j])
-	})
-
-	glog.V(4).Infof("%s existing %d chunks adds %d more", fh.FullPath(), len(fh.entry.Chunks), len(chunks))
-
-	fh.chunkAddLock.Lock()
-	fh.entry.Chunks = append(fh.entry.Chunks, newChunks...)
-	fh.entryViewCache = nil
-	fh.chunkAddLock.Unlock()
+func (fh *FileHandle) GetEntry() *LockedEntry {
+	return fh.entry
 }
 
-func (fh *FileHandle) Release() {
+func (fh *FileHandle) SetEntry(entry *filer_pb.Entry) {
+	if entry != nil {
+		fileSize := filer.FileSize(entry)
+		entry.Attributes.FileSize = fileSize
+		var resolveManifestErr error
+		fh.entryChunkGroup, resolveManifestErr = filer.NewChunkGroup(fh.wfs.LookupFn(), fh.wfs.chunkCache, entry.Chunks)
+		if resolveManifestErr != nil {
+			glog.Warningf("failed to resolve manifest chunks in %+v", entry)
+		}
+	} else {
+		glog.Fatalf("setting file handle entry to nil")
+	}
+	fh.entry.SetEntry(entry)
+}
+
+func (fh *FileHandle) UpdateEntry(fn func(entry *filer_pb.Entry)) *filer_pb.Entry {
+	return fh.entry.UpdateEntry(fn)
+}
+
+func (fh *FileHandle) AddChunks(chunks []*filer_pb.FileChunk) {
+	fh.entry.AppendChunks(chunks)
+}
+
+func (fh *FileHandle) ReleaseHandle() {
+
+	fhActiveLock := fh.wfs.fhLockTable.AcquireLock("ReleaseHandle", fh.fh, util.ExclusiveLock)
+	defer fh.wfs.fhLockTable.ReleaseLock(fh.fh, fhActiveLock)
+
 	fh.dirtyPages.Destroy()
+	if IsDebugFileReadWrite {
+		fh.mirrorFile.Close()
+	}
 }
 
 func lessThan(a, b *filer_pb.FileChunk) bool {
-	if a.Mtime == b.Mtime {
+	if a.ModifiedTsNs == b.ModifiedTsNs {
 		return a.Fid.FileKey < b.Fid.FileKey
 	}
-	return a.Mtime < b.Mtime
+	return a.ModifiedTsNs < b.ModifiedTsNs
 }

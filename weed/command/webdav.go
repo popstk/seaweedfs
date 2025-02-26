@@ -9,12 +9,12 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/chrislusf/seaweedfs/weed/glog"
-	"github.com/chrislusf/seaweedfs/weed/pb"
-	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
-	"github.com/chrislusf/seaweedfs/weed/security"
-	"github.com/chrislusf/seaweedfs/weed/server"
-	"github.com/chrislusf/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/pb"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/security"
+	weed_server "github.com/seaweedfs/seaweedfs/weed/server"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
 var (
@@ -23,6 +23,7 @@ var (
 
 type WebDavOption struct {
 	filer          *string
+	filerRootPath  *string
 	port           *int
 	collection     *string
 	replication    *string
@@ -31,6 +32,7 @@ type WebDavOption struct {
 	tlsCertificate *string
 	cacheDir       *string
 	cacheSizeMB    *int64
+	maxMB          *int
 }
 
 func init() {
@@ -44,6 +46,8 @@ func init() {
 	webDavStandaloneOptions.tlsCertificate = cmdWebDav.Flag.String("cert.file", "", "path to the TLS certificate file")
 	webDavStandaloneOptions.cacheDir = cmdWebDav.Flag.String("cacheDir", os.TempDir(), "local cache directory for file chunks")
 	webDavStandaloneOptions.cacheSizeMB = cmdWebDav.Flag.Int64("cacheCapacityMB", 0, "local cache capacity in MB")
+	webDavStandaloneOptions.maxMB = cmdWebDav.Flag.Int("maxMB", 4, "split files larger than the limit")
+	webDavStandaloneOptions.filerRootPath = cmdWebDav.Flag.String("filer.path", "/", "use this remote path from filer server")
 }
 
 var cmdWebDav = &Command{
@@ -56,7 +60,7 @@ var cmdWebDav = &Command{
 
 func runWebDav(cmd *Command, args []string) bool {
 
-	util.LoadConfiguration("security", false)
+	util.LoadSecurityConfiguration()
 
 	glog.V(0).Infof("Starting Seaweed WebDav Server %s at https port %d", util.Version(), *webDavStandaloneOptions.port)
 
@@ -85,7 +89,7 @@ func (wo *WebDavOption) startWebDav() bool {
 	var cipher bool
 	// connect to filer
 	for {
-		err := pb.WithGrpcFilerClient(false, filerAddress, grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
+		err := pb.WithGrpcFilerClient(false, 0, filerAddress, grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
 			resp, err := client.GetFilerConfiguration(context.Background(), &filer_pb.GetFilerConfigurationRequest{})
 			if err != nil {
 				return fmt.Errorf("get filer %s configuration: %v", filerAddress, err)
@@ -104,6 +108,7 @@ func (wo *WebDavOption) startWebDav() bool {
 
 	ws, webdavServer_err := weed_server.NewWebDavServer(&weed_server.WebDavOption{
 		Filer:          filerAddress,
+		FilerRootPath:  *wo.filerRootPath,
 		GrpcDialOption: grpcDialOption,
 		Collection:     *wo.collection,
 		Replication:    *wo.replication,
@@ -113,6 +118,7 @@ func (wo *WebDavOption) startWebDav() bool {
 		Cipher:         cipher,
 		CacheDir:       util.ResolvePath(*wo.cacheDir),
 		CacheSizeMB:    *wo.cacheSizeMB,
+		MaxMB:          *wo.maxMB,
 	})
 	if webdavServer_err != nil {
 		glog.Fatalf("WebDav Server startup error: %v", webdavServer_err)

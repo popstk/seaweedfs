@@ -8,9 +8,9 @@ import (
 	"image/png"
 	"io"
 
-	"github.com/disintegration/imaging"
+	"github.com/cognusion/imaging"
 
-	"github.com/chrislusf/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
 
 	_ "golang.org/x/image/webp"
 )

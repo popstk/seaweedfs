@@ -4,8 +4,9 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"github.com/chrislusf/seaweedfs/weed/pb/master_pb"
 	"io"
+
+	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
 )
 
 func init() {
@@ -27,6 +28,10 @@ func (c *commandCollectionDelete) Help() string {
 `
 }
 
+func (c *commandCollectionDelete) HasTag(CommandTag) bool {
+	return false
+}
+
 func (c *commandCollectionDelete) Do(args []string, commandEnv *CommandEnv, writer io.Writer) (err error) {
 
 	colDeleteCommand := flag.NewFlagSet(c.Name(), flag.ContinueOnError)
@@ -35,6 +40,7 @@ func (c *commandCollectionDelete) Do(args []string, commandEnv *CommandEnv, writ
 	if err = colDeleteCommand.Parse(args); err != nil {
 		return nil
 	}
+	infoAboutSimulationMode(writer, *applyBalancing, "-force")
 
 	if err = commandEnv.confirmIsLocked(args); err != nil {
 		return

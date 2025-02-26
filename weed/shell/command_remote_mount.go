@@ -4,13 +4,12 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"github.com/chrislusf/seaweedfs/weed/filer"
-	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
-	"github.com/chrislusf/seaweedfs/weed/pb/remote_pb"
-	"github.com/chrislusf/seaweedfs/weed/remote_storage"
-	"github.com/chrislusf/seaweedfs/weed/util"
-	"github.com/golang/protobuf/jsonpb"
-	"github.com/golang/protobuf/proto"
+	"github.com/seaweedfs/seaweedfs/weed/filer"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/pb/remote_pb"
+	"github.com/seaweedfs/seaweedfs/weed/remote_storage"
+	"github.com/seaweedfs/seaweedfs/weed/util"
+	"google.golang.org/protobuf/proto"
 	"io"
 	"os"
 	"strings"
@@ -43,6 +42,10 @@ func (c *commandRemoteMount) Help() string {
 	weed filer.remote.sync -filer=<filerHost>:<filerPort> -dir=/xxx
 
 `
+}
+
+func (c *commandRemoteMount) HasTag(CommandTag) bool {
+	return false
 }
 
 func (c *commandRemoteMount) Do(args []string, commandEnv *CommandEnv, writer io.Writer) (err error) {
@@ -101,17 +104,7 @@ func listExistingRemoteStorageMounts(commandEnv *CommandEnv, writer io.Writer) (
 }
 
 func jsonPrintln(writer io.Writer, message proto.Message) error {
-	if message == nil {
-		return nil
-	}
-	m := jsonpb.Marshaler{
-		EmitDefaults: false,
-		Indent:       "  ",
-	}
-
-	err := m.Marshal(writer, message)
-	fmt.Fprintln(writer)
-	return err
+	return filer.ProtoToText(writer, message)
 }
 
 func syncMetadata(commandEnv *CommandEnv, writer io.Writer, dir string, nonEmpty bool, remoteConf *remote_pb.RemoteConf, remote *remote_pb.RemoteStorageLocation) error {
@@ -175,19 +168,27 @@ func syncMetadata(commandEnv *CommandEnv, writer io.Writer, dir string, nonEmpty
 }
 
 // if an entry has synchronized metadata but has not synchronized content
-//    entry.Attributes.FileSize == entry.RemoteEntry.RemoteSize
-//    entry.Attributes.Mtime    == entry.RemoteEntry.RemoteMtime
-//    entry.RemoteEntry.LastLocalSyncTsNs == 0
+//
+//	entry.Attributes.FileSize == entry.RemoteEntry.RemoteSize
+//	entry.Attributes.Mtime    == entry.RemoteEntry.RemoteMtime
+//	entry.RemoteEntry.LastLocalSyncTsNs == 0
+//
 // if an entry has synchronized metadata but has synchronized content before
-//    entry.Attributes.FileSize == entry.RemoteEntry.RemoteSize
-//    entry.Attributes.Mtime    == entry.RemoteEntry.RemoteMtime
-//    entry.RemoteEntry.LastLocalSyncTsNs > 0
+//
+//	entry.Attributes.FileSize == entry.RemoteEntry.RemoteSize
+//	entry.Attributes.Mtime    == entry.RemoteEntry.RemoteMtime
+//	entry.RemoteEntry.LastLocalSyncTsNs > 0
+//
 // if an entry has synchronized metadata but has new updates
-//    entry.Attributes.Mtime * 1,000,000,000    > entry.RemoteEntry.LastLocalSyncTsNs
+//
+//	entry.Attributes.Mtime * 1,000,000,000    > entry.RemoteEntry.LastLocalSyncTsNs
 func doSaveRemoteEntry(client filer_pb.SeaweedFilerClient, localDir string, existingEntry *filer_pb.Entry, remoteEntry *filer_pb.RemoteEntry) error {
 	existingEntry.RemoteEntry = remoteEntry
 	existingEntry.Attributes.FileSize = uint64(remoteEntry.RemoteSize)
 	existingEntry.Attributes.Mtime = remoteEntry.RemoteMtime
+	existingEntry.Attributes.Md5 = nil
+	existingEntry.Chunks = nil
+	existingEntry.Content = nil
 	_, updateErr := client.UpdateEntry(context.Background(), &filer_pb.UpdateEntryRequest{
 		Directory: localDir,
 		Entry:     existingEntry,

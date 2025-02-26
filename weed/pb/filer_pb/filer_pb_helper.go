@@ -6,15 +6,22 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
-	"github.com/chrislusf/seaweedfs/weed/glog"
-	"github.com/chrislusf/seaweedfs/weed/storage/needle"
-	"github.com/golang/protobuf/proto"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
 	"github.com/viant/ptrie"
+	"google.golang.org/protobuf/proto"
 )
 
+const cutoffTimeNewEmptyDir = 3
+
 func (entry *Entry) IsInRemoteOnly() bool {
-	return len(entry.Chunks) == 0 && entry.RemoteEntry != nil && entry.RemoteEntry.RemoteSize > 0
+	return len(entry.GetChunks()) == 0 && entry.RemoteEntry != nil && entry.RemoteEntry.RemoteSize > 0
+}
+
+func (entry *Entry) IsDirectoryKeyObject() bool {
+	return entry.IsDirectory && entry.Attributes != nil && entry.Attributes.Mime != ""
 }
 
 func (entry *Entry) FileMode() (fileMode os.FileMode) {
@@ -22,6 +29,10 @@ func (entry *Entry) FileMode() (fileMode os.FileMode) {
 		fileMode = os.FileMode(entry.Attributes.FileMode)
 	}
 	return
+}
+
+func (entry *Entry) IsOlderDir() bool {
+	return entry.IsDirectory && entry.Attributes != nil && entry.Attributes.Mime == "" && entry.Attributes.GetCrtime() <= time.Now().Unix()-cutoffTimeNewEmptyDir
 }
 
 func ToFileIdObject(fileIdStr string) (*FileId, error) {
@@ -139,18 +150,22 @@ var ErrNotFound = errors.New("filer: no entry is found in filer store")
 func IsEmpty(event *SubscribeMetadataResponse) bool {
 	return event.EventNotification.NewEntry == nil && event.EventNotification.OldEntry == nil
 }
+
 func IsCreate(event *SubscribeMetadataResponse) bool {
 	return event.EventNotification.NewEntry != nil && event.EventNotification.OldEntry == nil
 }
+
 func IsUpdate(event *SubscribeMetadataResponse) bool {
 	return event.EventNotification.NewEntry != nil &&
 		event.EventNotification.OldEntry != nil &&
 		event.Directory == event.EventNotification.NewParentPath &&
 		event.EventNotification.NewEntry.Name == event.EventNotification.OldEntry.Name
 }
+
 func IsDelete(event *SubscribeMetadataResponse) bool {
 	return event.EventNotification.NewEntry == nil && event.EventNotification.OldEntry != nil
 }
+
 func IsRename(event *SubscribeMetadataResponse) bool {
 	return event.EventNotification.NewEntry != nil &&
 		event.EventNotification.OldEntry != nil &&

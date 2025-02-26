@@ -61,8 +61,10 @@ const (
 	ErrInvalidMaxKeys
 	ErrInvalidMaxUploads
 	ErrInvalidMaxParts
+	ErrInvalidMaxDeleteObjects
 	ErrInvalidPartNumberMarker
 	ErrInvalidPart
+	ErrInvalidRange
 	ErrInternalError
 	ErrInvalidCopyDest
 	ErrInvalidCopySource
@@ -102,6 +104,12 @@ const (
 
 	ErrExistingObjectIsDirectory
 	ErrExistingObjectIsFile
+
+	ErrTooManyRequest
+	ErrRequestBytesExceed
+
+	OwnershipControlsNotFoundError
+	ErrNoSuchTagSet
 )
 
 // error code to APIError structure, these fields carry respective
@@ -157,6 +165,11 @@ var errorCodeResponse = map[ErrorCode]APIError{
 		Description:    "Argument max-parts must be an integer between 0 and 2147483647",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
+	ErrInvalidMaxDeleteObjects: {
+		Code:           "InvalidArgument",
+		Description:    "Argument objects can contain a list of up to 1000 keys",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
 	ErrInvalidPartNumberMarker: {
 		Code:           "InvalidArgument",
 		Description:    "Argument partNumberMarker must be an integer.",
@@ -170,6 +183,11 @@ var errorCodeResponse = map[ErrorCode]APIError{
 	ErrNoSuchBucketPolicy: {
 		Code:           "NoSuchBucketPolicy",
 		Description:    "The bucket policy does not exist",
+		HTTPStatusCode: http.StatusNotFound,
+	},
+	ErrNoSuchTagSet: {
+		Code:           "NoSuchTagSet",
+		Description:    "The TagSet does not exist",
 		HTTPStatusCode: http.StatusNotFound,
 	},
 	ErrNoSuchCORSConfiguration: {
@@ -364,6 +382,11 @@ var errorCodeResponse = map[ErrorCode]APIError{
 		Description:    "Invalid Request",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
+	ErrInvalidRange: {
+		Code:           "InvalidRange",
+		Description:    "The requested range is not satisfiable",
+		HTTPStatusCode: http.StatusRequestedRangeNotSatisfiable,
+	},
 	ErrAuthNotSetup: {
 		Code:           "InvalidRequest",
 		Description:    "Signed request requires setting up SeaweedFS S3 authentication",
@@ -388,6 +411,22 @@ var errorCodeResponse = map[ErrorCode]APIError{
 		Code:           "ExistingObjectIsFile",
 		Description:    "Existing Object is a file.",
 		HTTPStatusCode: http.StatusConflict,
+	},
+	ErrTooManyRequest: {
+		Code:           "ErrTooManyRequest",
+		Description:    "Too many simultaneous request count",
+		HTTPStatusCode: http.StatusTooManyRequests,
+	},
+	ErrRequestBytesExceed: {
+		Code:           "ErrRequestBytesExceed",
+		Description:    "Simultaneous request bytes exceed limitations",
+		HTTPStatusCode: http.StatusTooManyRequests,
+	},
+
+	OwnershipControlsNotFoundError: {
+		Code:           "OwnershipControlsNotFoundError",
+		Description:    "The bucket ownership controls were not found",
+		HTTPStatusCode: http.StatusNotFound,
 	},
 }
 

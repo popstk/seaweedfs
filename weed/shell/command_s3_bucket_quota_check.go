@@ -4,8 +4,8 @@ import (
 	"bytes"
 	"flag"
 	"fmt"
-	"github.com/chrislusf/seaweedfs/weed/filer"
-	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/filer"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"io"
 	"math"
 )
@@ -29,6 +29,10 @@ func (c *commandS3BucketQuotaEnforce) Help() string {
 `
 }
 
+func (c *commandS3BucketQuotaEnforce) HasTag(CommandTag) bool {
+	return false
+}
+
 func (c *commandS3BucketQuotaEnforce) Do(args []string, commandEnv *CommandEnv, writer io.Writer) (err error) {
 
 	bucketCommand := flag.NewFlagSet(c.Name(), flag.ContinueOnError)
@@ -36,6 +40,7 @@ func (c *commandS3BucketQuotaEnforce) Do(args []string, commandEnv *CommandEnv, 
 	if err = bucketCommand.Parse(args); err != nil {
 		return nil
 	}
+	infoAboutSimulationMode(writer, *applyQuotaLimit, "-apply")
 
 	// collect collection information
 	topologyInfo, _, err := collectTopologyInfo(commandEnv, 0)
@@ -64,7 +69,7 @@ func (c *commandS3BucketQuotaEnforce) Do(args []string, commandEnv *CommandEnv, 
 		if !entry.IsDirectory {
 			return nil
 		}
-		collection := entry.Name
+		collection := getCollectionName(commandEnv, entry.Name)
 		var collectionSize float64
 		if collectionInfo, found := collectionInfos[collection]; found {
 			collectionSize = collectionInfo.Size
@@ -129,7 +134,7 @@ func (c *commandS3BucketQuotaEnforce) processEachBucket(fc *filer.FilerConf, fil
 		} else {
 			fmt.Fprintf(writer, "    changing bucket %s to writable.\n", entry.Name)
 		}
-		fc.AddLocationConf(locConf)
+		fc.SetLocationConf(locConf)
 	}
 
 	return

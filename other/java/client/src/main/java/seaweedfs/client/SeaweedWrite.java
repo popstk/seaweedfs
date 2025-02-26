@@ -14,7 +14,9 @@ import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.security.SecureRandom;
+import java.security.MessageDigest;
 import java.util.List;
+import java.util.Base64;
 
 public class SeaweedWrite {
 
@@ -24,6 +26,7 @@ public class SeaweedWrite {
 
     public static void writeData(FilerProto.Entry.Builder entry,
                                  final String replication,
+                                 String collection,
                                  final FilerClient filerClient,
                                  final long offset,
                                  final byte[] bytes,
@@ -34,7 +37,7 @@ public class SeaweedWrite {
         for (long waitTime = 1000L; waitTime < 10 * 1000; waitTime += waitTime / 2) {
             try {
                 FilerProto.FileChunk.Builder chunkBuilder = writeChunk(
-                        replication, filerClient, offset, bytes, bytesOffset, bytesLength, path);
+                        replication, collection, filerClient, offset, bytes, bytesOffset, bytesLength, path);
                 lastException = null;
                 synchronized (entry) {
                     entry.addChunks(chunkBuilder);
@@ -57,6 +60,7 @@ public class SeaweedWrite {
     }
 
     public static FilerProto.FileChunk.Builder writeChunk(final String replication,
+                                                          final String collection,
                                                           final FilerClient filerClient,
                                                           final long offset,
                                                           final byte[] bytes,
@@ -65,7 +69,7 @@ public class SeaweedWrite {
                                                           final String path) throws IOException {
         FilerProto.AssignVolumeResponse response = filerClient.getBlockingStub().assignVolume(
                 FilerProto.AssignVolumeRequest.newBuilder()
-                        .setCollection(filerClient.getCollection())
+                        .setCollection(Strings.isNullOrEmpty(collection) ? filerClient.getCollection() : collection)
                         .setReplication(Strings.isNullOrEmpty(replication) ? filerClient.getReplication() : replication)
                         .setDataCenter("")
                         .setTtlSec(0)
@@ -96,7 +100,7 @@ public class SeaweedWrite {
                 .setFileId(fileId)
                 .setOffset(offset)
                 .setSize(bytesLength)
-                .setMtime(System.currentTimeMillis() / 10000L)
+                .setModifiedTsNs(System.nanoTime())
                 .setETag(etag)
                 .setCipherKey(cipherKeyString);
     }
@@ -123,13 +127,20 @@ public class SeaweedWrite {
                                           final byte[] bytes,
                                           final long bytesOffset, final long bytesLength,
                                           byte[] cipherKey) throws IOException {
+        MessageDigest md = null;
+        try {
+            md = MessageDigest.getInstance("MD5");
+        } catch (java.security.NoSuchAlgorithmException e) {
+        }
 
         InputStream inputStream = null;
         if (cipherKey == null || cipherKey.length == 0) {
+            md.update(bytes, (int) bytesOffset, (int) bytesLength);
             inputStream = new ByteArrayInputStream(bytes, (int) bytesOffset, (int) bytesLength);
         } else {
             try {
                 byte[] encryptedBytes = SeaweedCipher.encrypt(bytes, (int) bytesOffset, (int) bytesLength, cipherKey);
+                md.update(encryptedBytes);
                 inputStream = new ByteArrayInputStream(encryptedBytes, 0, encryptedBytes.length);
             } catch (Exception e) {
                 throw new IOException("fail to encrypt data", e);
@@ -140,6 +151,7 @@ public class SeaweedWrite {
         if (auth != null && auth.length() != 0) {
             post.addHeader("Authorization", "BEARER " + auth);
         }
+        post.addHeader("Content-MD5", Base64.getEncoder().encodeToString(md.digest()));
 
         post.setEntity(MultipartEntityBuilder.create()
                 .setMode(HttpMultipartMode.BROWSER_COMPATIBLE)
@@ -149,6 +161,13 @@ public class SeaweedWrite {
         CloseableHttpResponse response = SeaweedUtil.getClosableHttpClient().execute(post);
 
         try {
+            if (response.getStatusLine().getStatusCode() / 100 != 2) {
+                if (response.getEntity().getContentType() != null && response.getEntity().getContentType().getValue().equals("application/json")) {
+                    throw new IOException(EntityUtils.toString(response.getEntity(), "UTF-8"));
+                } else {
+                    throw new IOException(response.getStatusLine().getReasonPhrase());
+                }
+            }
 
             String etag = response.getLastHeader("ETag").getValue();
 

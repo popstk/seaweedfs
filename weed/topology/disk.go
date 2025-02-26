@@ -2,15 +2,17 @@ package topology
 
 import (
 	"fmt"
-	"github.com/chrislusf/seaweedfs/weed/storage/types"
-	"github.com/chrislusf/seaweedfs/weed/util"
 	"sync"
+	"sync/atomic"
 
-	"github.com/chrislusf/seaweedfs/weed/pb/master_pb"
-	"github.com/chrislusf/seaweedfs/weed/storage/erasure_coding"
-	"github.com/chrislusf/seaweedfs/weed/storage/needle"
+	"github.com/seaweedfs/seaweedfs/weed/storage/types"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 
-	"github.com/chrislusf/seaweedfs/weed/storage"
+	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
+	"github.com/seaweedfs/seaweedfs/weed/storage/erasure_coding"
+	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
+
+	"github.com/seaweedfs/seaweedfs/weed/storage"
 )
 
 type Disk struct {
@@ -64,7 +66,7 @@ func (d *DiskUsages) ToDiskInfo() map[string]*master_pb.DiskInfo {
 		m := &master_pb.DiskInfo{
 			VolumeCount:       diskUsageCounts.volumeCount,
 			MaxVolumeCount:    diskUsageCounts.maxVolumeCount,
-			FreeVolumeCount:   diskUsageCounts.maxVolumeCount - diskUsageCounts.volumeCount,
+			FreeVolumeCount:   diskUsageCounts.maxVolumeCount - (diskUsageCounts.volumeCount - diskUsageCounts.remoteVolumeCount) - (diskUsageCounts.ecShardCount+1)/erasure_coding.DataShardsCount,
 			ActiveVolumeCount: diskUsageCounts.activeVolumeCount,
 			RemoteVolumeCount: diskUsageCounts.remoteVolumeCount,
 		}
@@ -100,11 +102,11 @@ type DiskUsageCounts struct {
 }
 
 func (a *DiskUsageCounts) addDiskUsageCounts(b *DiskUsageCounts) {
-	a.volumeCount += b.volumeCount
-	a.remoteVolumeCount += b.remoteVolumeCount
-	a.activeVolumeCount += b.activeVolumeCount
-	a.ecShardCount += b.ecShardCount
-	a.maxVolumeCount += b.maxVolumeCount
+	atomic.AddInt64(&a.volumeCount, b.volumeCount)
+	atomic.AddInt64(&a.remoteVolumeCount, b.remoteVolumeCount)
+	atomic.AddInt64(&a.activeVolumeCount, b.activeVolumeCount)
+	atomic.AddInt64(&a.ecShardCount, b.ecShardCount)
+	atomic.AddInt64(&a.maxVolumeCount, b.maxVolumeCount)
 }
 
 func (a *DiskUsageCounts) FreeSpace() int64 {
@@ -143,15 +145,14 @@ func (d *Disk) String() string {
 	return fmt.Sprintf("Disk:%s, volumes:%v, ecShards:%v", d.NodeImpl.String(), d.volumes, d.ecShards)
 }
 
-func (d *Disk) AddOrUpdateVolume(v storage.VolumeInfo) (isNew, isChangedRO bool) {
+func (d *Disk) AddOrUpdateVolume(v storage.VolumeInfo) (isNew, isChanged bool) {
 	d.Lock()
 	defer d.Unlock()
 	return d.doAddOrUpdateVolume(v)
 }
 
-func (d *Disk) doAddOrUpdateVolume(v storage.VolumeInfo) (isNew, isChangedRO bool) {
-	deltaDiskUsages := newDiskUsages()
-	deltaDiskUsage := deltaDiskUsages.getOrCreateDisk(types.ToDiskType(v.DiskType))
+func (d *Disk) doAddOrUpdateVolume(v storage.VolumeInfo) (isNew, isChanged bool) {
+	deltaDiskUsage := &DiskUsageCounts{}
 	if oldV, ok := d.volumes[v.Id]; !ok {
 		d.volumes[v.Id] = v
 		deltaDiskUsage.volumeCount = 1
@@ -162,7 +163,7 @@ func (d *Disk) doAddOrUpdateVolume(v storage.VolumeInfo) (isNew, isChangedRO boo
 			deltaDiskUsage.activeVolumeCount = 1
 		}
 		d.UpAdjustMaxVolumeId(v.Id)
-		d.UpAdjustDiskUsageDelta(deltaDiskUsages)
+		d.UpAdjustDiskUsageDelta(types.ToDiskType(v.DiskType), deltaDiskUsage)
 		isNew = true
 	} else {
 		if oldV.IsRemote() != v.IsRemote() {
@@ -172,9 +173,9 @@ func (d *Disk) doAddOrUpdateVolume(v storage.VolumeInfo) (isNew, isChangedRO boo
 			if oldV.IsRemote() {
 				deltaDiskUsage.remoteVolumeCount = -1
 			}
-			d.UpAdjustDiskUsageDelta(deltaDiskUsages)
+			d.UpAdjustDiskUsageDelta(types.ToDiskType(v.DiskType), deltaDiskUsage)
 		}
-		isChangedRO = d.volumes[v.Id].ReadOnly != v.ReadOnly
+		isChanged = d.volumes[v.Id].ReadOnly != v.ReadOnly
 		d.volumes[v.Id] = v
 	}
 	return
@@ -198,6 +199,12 @@ func (d *Disk) GetVolumesById(id needle.VolumeId) (storage.VolumeInfo, error) {
 	} else {
 		return storage.VolumeInfo{}, fmt.Errorf("volumeInfo not found")
 	}
+}
+
+func (d *Disk) DeleteVolumeById(id needle.VolumeId) {
+	d.Lock()
+	defer d.Unlock()
+	delete(d.volumes, id)
 }
 
 func (d *Disk) GetDataCenter() *DataCenter {
@@ -243,7 +250,7 @@ func (d *Disk) ToDiskInfo() *master_pb.DiskInfo {
 		Type:              string(d.Id()),
 		VolumeCount:       diskUsage.volumeCount,
 		MaxVolumeCount:    diskUsage.maxVolumeCount,
-		FreeVolumeCount:   diskUsage.maxVolumeCount - diskUsage.volumeCount,
+		FreeVolumeCount:   diskUsage.maxVolumeCount - (diskUsage.volumeCount - diskUsage.remoteVolumeCount) - (diskUsage.ecShardCount+1)/erasure_coding.DataShardsCount,
 		ActiveVolumeCount: diskUsage.activeVolumeCount,
 		RemoteVolumeCount: diskUsage.remoteVolumeCount,
 	}

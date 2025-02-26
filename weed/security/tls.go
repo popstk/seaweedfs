@@ -1,23 +1,23 @@
 package security
 
 import (
-	"context"
 	"crypto/tls"
 	"crypto/x509"
-	"io/ioutil"
+	"fmt"
 	"os"
+	"slices"
 	"strings"
+	"time"
 
-	grpc_auth "github.com/grpc-ecosystem/go-grpc-middleware/auth"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/credentials"
-	"google.golang.org/grpc/peer"
-	"google.golang.org/grpc/status"
-
-	"github.com/chrislusf/seaweedfs/weed/glog"
-	"github.com/chrislusf/seaweedfs/weed/util"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/credentials/tls/certprovider/pemfile"
+	"google.golang.org/grpc/security/advancedtls"
 )
+
+const CredRefreshingInterval = time.Duration(5) * time.Hour
 
 type Authenticator struct {
 	AllowedWildcardDomain string
@@ -29,28 +29,57 @@ func LoadServerTLS(config *util.ViperProxy, component string) (grpc.ServerOption
 		return nil, nil
 	}
 
-	// load cert/key, ca cert
-	cert, err := tls.LoadX509KeyPair(config.GetString(component+".cert"), config.GetString(component+".key"))
-	if err != nil {
-		glog.V(1).Infof("load cert: %s / key: %s error: %v",
-			config.GetString(component+".cert"),
-			config.GetString(component+".key"),
-			err)
+	serverOptions := pemfile.Options{
+		CertFile:        config.GetString(component + ".cert"),
+		KeyFile:         config.GetString(component + ".key"),
+		RefreshDuration: CredRefreshingInterval,
+	}
+	if serverOptions.CertFile == "" || serverOptions.KeyFile == "" {
 		return nil, nil
 	}
-	caCert, err := os.ReadFile(config.GetString("grpc.ca"))
-	if err != nil {
-		glog.V(1).Infof("read ca cert file %s error: %v", config.GetString("grpc.ca"), err)
-		return nil, nil
-	}
-	caCertPool := x509.NewCertPool()
-	caCertPool.AppendCertsFromPEM(caCert)
-	ta := credentials.NewTLS(&tls.Config{
-		Certificates: []tls.Certificate{cert},
-		ClientCAs:    caCertPool,
-		ClientAuth:   tls.RequireAndVerifyClientCert,
-	})
 
+	serverIdentityProvider, err := pemfile.NewProvider(serverOptions)
+	if err != nil {
+		glog.Warningf("pemfile.NewProvider(%v) %v failed: %v", serverOptions, component, err)
+		return nil, nil
+	}
+
+	serverRootOptions := pemfile.Options{
+		RootFile:        config.GetString("grpc.ca"),
+		RefreshDuration: CredRefreshingInterval,
+	}
+	serverRootProvider, err := pemfile.NewProvider(serverRootOptions)
+	if err != nil {
+		glog.Warningf("pemfile.NewProvider(%v) failed: %v", serverRootOptions, err)
+		return nil, nil
+	}
+
+	// Start a server and create a client using advancedtls API with Provider.
+	options := &advancedtls.Options{
+		IdentityOptions: advancedtls.IdentityCertificateOptions{
+			IdentityProvider: serverIdentityProvider,
+		},
+		RootOptions: advancedtls.RootCertificateOptions{
+			RootProvider: serverRootProvider,
+		},
+		RequireClientCert: true,
+		VerificationType:  advancedtls.CertVerification,
+	}
+	options.MinTLSVersion, err = TlsVersionByName(config.GetString("tls.min_version"))
+	if err != nil {
+		glog.Warningf("tls min version parse failed, %v", err)
+		return nil, nil
+	}
+	options.MaxTLSVersion, err = TlsVersionByName(config.GetString("tls.max_version"))
+	if err != nil {
+		glog.Warningf("tls max version parse failed, %v", err)
+		return nil, nil
+	}
+	options.CipherSuites, err = TlsCipherSuiteByNames(config.GetString("tls.cipher_suites"))
+	if err != nil {
+		glog.Warningf("tls cipher suite parse failed, %v", err)
+		return nil, nil
+	}
 	allowedCommonNames := config.GetString(component + ".allowed_commonNames")
 	allowedWildcardDomain := config.GetString("grpc.allowed_wildcard_domain")
 	if allowedCommonNames != "" || allowedWildcardDomain != "" {
@@ -62,45 +91,71 @@ func LoadServerTLS(config *util.ViperProxy, component string) (grpc.ServerOption
 			AllowedCommonNames:    allowedCommonNamesMap,
 			AllowedWildcardDomain: allowedWildcardDomain,
 		}
-		return grpc.Creds(ta), grpc.UnaryInterceptor(grpc_auth.UnaryServerInterceptor(auther.Authenticate))
+		options.AdditionalPeerVerification = auther.Authenticate
+	} else {
+		options.AdditionalPeerVerification = func(params *advancedtls.HandshakeVerificationInfo) (*advancedtls.PostHandshakeVerificationResults, error) {
+			return &advancedtls.PostHandshakeVerificationResults{}, nil
+		}
+	}
+	ta, err := advancedtls.NewServerCreds(options)
+	if err != nil {
+		glog.Warningf("advancedtls.NewServerCreds(%v) failed: %v", options, err)
+		return nil, nil
 	}
 	return grpc.Creds(ta), nil
 }
 
 func LoadClientTLS(config *util.ViperProxy, component string) grpc.DialOption {
 	if config == nil {
-		return grpc.WithInsecure()
+		return grpc.WithTransportCredentials(insecure.NewCredentials())
 	}
 
 	certFileName, keyFileName, caFileName := config.GetString(component+".cert"), config.GetString(component+".key"), config.GetString("grpc.ca")
 	if certFileName == "" || keyFileName == "" || caFileName == "" {
-		return grpc.WithInsecure()
+		return grpc.WithTransportCredentials(insecure.NewCredentials())
 	}
 
-	// load cert/key, cacert
-	cert, err := tls.LoadX509KeyPair(certFileName, keyFileName)
-	if err != nil {
-		glog.V(1).Infof("load cert/key error: %v", err)
-		return grpc.WithInsecure()
+	clientOptions := pemfile.Options{
+		CertFile:        certFileName,
+		KeyFile:         keyFileName,
+		RefreshDuration: CredRefreshingInterval,
 	}
-	caCert, err := os.ReadFile(caFileName)
+	clientProvider, err := pemfile.NewProvider(clientOptions)
 	if err != nil {
-		glog.V(1).Infof("read ca cert file error: %v", err)
-		return grpc.WithInsecure()
+		glog.Warningf("pemfile.NewProvider(%v) failed %v", clientOptions, err)
+		return grpc.WithTransportCredentials(insecure.NewCredentials())
 	}
-	caCertPool := x509.NewCertPool()
-	caCertPool.AppendCertsFromPEM(caCert)
-
-	ta := credentials.NewTLS(&tls.Config{
-		Certificates:       []tls.Certificate{cert},
-		RootCAs:            caCertPool,
-		InsecureSkipVerify: true,
-	})
+	clientRootOptions := pemfile.Options{
+		RootFile:        config.GetString("grpc.ca"),
+		RefreshDuration: CredRefreshingInterval,
+	}
+	clientRootProvider, err := pemfile.NewProvider(clientRootOptions)
+	if err != nil {
+		glog.Warningf("pemfile.NewProvider(%v) failed: %v", clientRootOptions, err)
+		return grpc.WithTransportCredentials(insecure.NewCredentials())
+	}
+	options := &advancedtls.Options{
+		IdentityOptions: advancedtls.IdentityCertificateOptions{
+			IdentityProvider: clientProvider,
+		},
+		AdditionalPeerVerification: func(params *advancedtls.HandshakeVerificationInfo) (*advancedtls.PostHandshakeVerificationResults, error) {
+			return &advancedtls.PostHandshakeVerificationResults{}, nil
+		},
+		RootOptions: advancedtls.RootCertificateOptions{
+			RootProvider: clientRootProvider,
+		},
+		VerificationType: advancedtls.CertVerification,
+	}
+	ta, err := advancedtls.NewClientCreds(options)
+	if err != nil {
+		glog.Warningf("advancedtls.NewClientCreds(%v) failed: %v", options, err)
+		return grpc.WithTransportCredentials(insecure.NewCredentials())
+	}
 	return grpc.WithTransportCredentials(ta)
 }
 
 func LoadClientTLSHTTP(clientCertFile string) *tls.Config {
-	clientCerts, err := ioutil.ReadFile(clientCertFile)
+	clientCerts, err := os.ReadFile(clientCertFile)
 	if err != nil {
 		glog.Fatal(err)
 	}
@@ -116,27 +171,68 @@ func LoadClientTLSHTTP(clientCertFile string) *tls.Config {
 	}
 }
 
-func (a Authenticator) Authenticate(ctx context.Context) (newCtx context.Context, err error) {
-	p, ok := peer.FromContext(ctx)
-	if !ok {
-		return ctx, status.Error(codes.Unauthenticated, "no peer found")
+func (a Authenticator) Authenticate(params *advancedtls.HandshakeVerificationInfo) (*advancedtls.PostHandshakeVerificationResults, error) {
+	if a.AllowedWildcardDomain != "" && strings.HasSuffix(params.Leaf.Subject.CommonName, a.AllowedWildcardDomain) {
+		return &advancedtls.PostHandshakeVerificationResults{}, nil
 	}
+	if _, ok := a.AllowedCommonNames[params.Leaf.Subject.CommonName]; ok {
+		return &advancedtls.PostHandshakeVerificationResults{}, nil
+	}
+	err := fmt.Errorf("Authenticate: invalid subject client common name: %s", params.Leaf.Subject.CommonName)
+	glog.Error(err)
+	return nil, err
+}
 
-	tlsAuth, ok := p.AuthInfo.(credentials.TLSInfo)
-	if !ok {
-		return ctx, status.Error(codes.Unauthenticated, "unexpected peer transport credentials")
+func FixTlsConfig(viper *util.ViperProxy, config *tls.Config) error {
+	var err error
+	config.MinVersion, err = TlsVersionByName(viper.GetString("tls.min_version"))
+	if err != nil {
+		return err
 	}
-	if len(tlsAuth.State.VerifiedChains) == 0 || len(tlsAuth.State.VerifiedChains[0]) == 0 {
-		return ctx, status.Error(codes.Unauthenticated, "could not verify peer certificate")
+	config.MaxVersion, err = TlsVersionByName(viper.GetString("tls.max_version"))
+	if err != nil {
+		return err
 	}
+	config.CipherSuites, err = TlsCipherSuiteByNames(viper.GetString("tls.cipher_suites"))
+	return err
+}
 
-	commonName := tlsAuth.State.VerifiedChains[0][0].Subject.CommonName
-	if a.AllowedWildcardDomain != "" && strings.HasSuffix(commonName, a.AllowedWildcardDomain) {
-		return ctx, nil
+func TlsVersionByName(name string) (uint16, error) {
+	switch name {
+	case "":
+		return 0, nil
+	case "SSLv3":
+		return tls.VersionSSL30, nil
+	case "TLS 1.0":
+		return tls.VersionTLS10, nil
+	case "TLS 1.1":
+		return tls.VersionTLS11, nil
+	case "TLS 1.2":
+		return tls.VersionTLS12, nil
+	case "TLS 1.3":
+		return tls.VersionTLS13, nil
+	default:
+		return 0, fmt.Errorf("invalid tls version %s", name)
 	}
-	if _, ok := a.AllowedCommonNames[commonName]; ok {
-		return ctx, nil
-	}
+}
 
-	return ctx, status.Errorf(codes.Unauthenticated, "invalid subject common name: %s", commonName)
+func TlsCipherSuiteByNames(cipherSuiteNames string) ([]uint16, error) {
+	cipherSuiteNames = strings.TrimSpace(cipherSuiteNames)
+	if cipherSuiteNames == "" {
+		return nil, nil
+	}
+	names := strings.Split(cipherSuiteNames, ",")
+	cipherSuites := tls.CipherSuites()
+	cipherIds := make([]uint16, 0, len(names))
+	for _, name := range names {
+		name = strings.TrimSpace(name)
+		index := slices.IndexFunc(cipherSuites, func(suite *tls.CipherSuite) bool {
+			return name == suite.Name
+		})
+		if index == -1 {
+			return nil, fmt.Errorf("invalid tls cipher suite name %s", name)
+		}
+		cipherIds = append(cipherIds, cipherSuites[index].ID)
+	}
+	return cipherIds, nil
 }

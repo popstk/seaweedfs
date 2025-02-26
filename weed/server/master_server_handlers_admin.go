@@ -3,20 +3,23 @@ package weed_server
 import (
 	"context"
 	"fmt"
-	"github.com/chrislusf/seaweedfs/weed/pb"
-	"math/rand"
+	"math/rand/v2"
 	"net/http"
 	"strconv"
 
-	"github.com/chrislusf/seaweedfs/weed/glog"
-	"github.com/chrislusf/seaweedfs/weed/operation"
-	"github.com/chrislusf/seaweedfs/weed/pb/volume_server_pb"
-	"github.com/chrislusf/seaweedfs/weed/storage/backend/memory_map"
-	"github.com/chrislusf/seaweedfs/weed/storage/needle"
-	"github.com/chrislusf/seaweedfs/weed/storage/super_block"
-	"github.com/chrislusf/seaweedfs/weed/storage/types"
-	"github.com/chrislusf/seaweedfs/weed/topology"
-	"github.com/chrislusf/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/pb"
+	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
+
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/operation"
+	"github.com/seaweedfs/seaweedfs/weed/pb/volume_server_pb"
+	"github.com/seaweedfs/seaweedfs/weed/storage/backend/memory_map"
+	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
+	"github.com/seaweedfs/seaweedfs/weed/storage/super_block"
+	"github.com/seaweedfs/seaweedfs/weed/storage/types"
+	"github.com/seaweedfs/seaweedfs/weed/topology"
+	"github.com/seaweedfs/seaweedfs/weed/util"
+	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
 )
 
 func (ms *MasterServer) collectionDeleteHandler(w http.ResponseWriter, r *http.Request) {
@@ -47,7 +50,7 @@ func (ms *MasterServer) collectionDeleteHandler(w http.ResponseWriter, r *http.R
 func (ms *MasterServer) dirStatusHandler(w http.ResponseWriter, r *http.Request) {
 	m := make(map[string]interface{})
 	m["Version"] = util.Version()
-	m["Topology"] = ms.Topo.ToMap()
+	m["Topology"] = ms.Topo.ToInfo()
 	writeJsonQuiet(w, r, http.StatusOK, m)
 }
 
@@ -64,12 +67,12 @@ func (ms *MasterServer) volumeVacuumHandler(w http.ResponseWriter, r *http.Reque
 		}
 	}
 	// glog.Infoln("garbageThreshold =", gcThreshold)
-	ms.Topo.Vacuum(ms.grpcDialOption, gcThreshold, ms.preallocateSize)
+	ms.Topo.Vacuum(ms.grpcDialOption, gcThreshold, ms.option.MaxParallelVacuumPerServer, 0, "", ms.preallocateSize, false)
 	ms.dirStatusHandler(w, r)
 }
 
 func (ms *MasterServer) volumeGrowHandler(w http.ResponseWriter, r *http.Request) {
-	count := 0
+	count := uint64(0)
 	option, err := ms.getVolumeGrowOption(r)
 	if err != nil {
 		writeJsonError(w, r, http.StatusNotAcceptable, err)
@@ -77,11 +80,16 @@ func (ms *MasterServer) volumeGrowHandler(w http.ResponseWriter, r *http.Request
 	}
 	glog.V(0).Infof("volumeGrowHandler received %v from %v", option.String(), r.RemoteAddr)
 
-	if count, err = strconv.Atoi(r.FormValue("count")); err == nil {
-		if ms.Topo.AvailableSpaceFor(option) < int64(count*option.ReplicaPlacement.GetCopyCount()) {
-			err = fmt.Errorf("only %d volumes left, not enough for %d", ms.Topo.AvailableSpaceFor(option), count*option.ReplicaPlacement.GetCopyCount())
+	if count, err = strconv.ParseUint(r.FormValue("count"), 10, 32); err == nil {
+		replicaCount := int64(count * uint64(option.ReplicaPlacement.GetCopyCount()))
+		if ms.Topo.AvailableSpaceFor(option) < replicaCount {
+			err = fmt.Errorf("only %d volumes left, not enough for %d", ms.Topo.AvailableSpaceFor(option), replicaCount)
+		} else if !ms.Topo.DataCenterExists(option.DataCenter) {
+			err = fmt.Errorf("data center %v not found in topology", option.DataCenter)
 		} else {
-			count, err = ms.vg.GrowByCountAndType(ms.grpcDialOption, count, option, ms.Topo)
+			var newVidLocations []*master_pb.VolumeLocation
+			newVidLocations, err = ms.vg.GrowByCountAndType(ms.grpcDialOption, uint32(count), option, ms.Topo)
+			count = uint64(len(newVidLocations))
 		}
 	} else {
 		err = fmt.Errorf("can not parse parameter count %s", r.FormValue("count"))
@@ -106,12 +114,12 @@ func (ms *MasterServer) redirectHandler(w http.ResponseWriter, r *http.Request) 
 	collection := r.FormValue("collection")
 	location := ms.findVolumeLocation(collection, vid)
 	if location.Error == "" {
-		loc := location.Locations[rand.Intn(len(location.Locations))]
-		var url string
+		loc := location.Locations[rand.IntN(len(location.Locations))]
+		url, _ := util_http.NormalizeUrl(loc.PublicUrl)
 		if r.URL.RawQuery != "" {
-			url = util.NormalizeUrl(loc.PublicUrl) + r.URL.Path + "?" + r.URL.RawQuery
+			url = url + r.URL.Path + "?" + r.URL.RawQuery
 		} else {
-			url = util.NormalizeUrl(loc.PublicUrl) + r.URL.Path
+			url = url + r.URL.Path
 		}
 		http.Redirect(w, r, url, http.StatusPermanentRedirect)
 	} else {
@@ -121,13 +129,13 @@ func (ms *MasterServer) redirectHandler(w http.ResponseWriter, r *http.Request) 
 
 func (ms *MasterServer) submitFromMasterServerHandler(w http.ResponseWriter, r *http.Request) {
 	if ms.Topo.IsLeader() {
-		submitForClientHandler(w, r, func() pb.ServerAddress { return ms.option.Master }, ms.grpcDialOption)
+		submitForClientHandler(w, r, func(ctx context.Context) pb.ServerAddress { return ms.option.Master }, ms.grpcDialOption)
 	} else {
 		masterUrl, err := ms.Topo.Leader()
 		if err != nil {
 			writeJsonError(w, r, http.StatusInternalServerError, err)
 		} else {
-			submitForClientHandler(w, r, func() pb.ServerAddress { return masterUrl }, ms.grpcDialOption)
+			submitForClientHandler(w, r, func(ctx context.Context) pb.ServerAddress { return masterUrl }, ms.grpcDialOption)
 		}
 	}
 }
@@ -170,4 +178,59 @@ func (ms *MasterServer) getVolumeGrowOption(r *http.Request) (*topology.VolumeGr
 		MemoryMapMaxSizeMb: memoryMapMaxSizeMb,
 	}
 	return volumeGrowOption, nil
+}
+
+func (ms *MasterServer) collectionInfoHandler(w http.ResponseWriter, r *http.Request) {
+	//get collection from request
+	collectionName := r.FormValue("collection")
+	if collectionName == "" {
+		writeJsonError(w, r, http.StatusBadRequest, fmt.Errorf("collection is required"))
+		return
+	}
+	//output details of the volumes?
+	detail := r.FormValue("detail") == "true"
+	//collect collection info
+	collection, ok := ms.Topo.FindCollection(collectionName)
+	if !ok {
+		writeJsonError(w, r, http.StatusBadRequest, fmt.Errorf("collection %s does not exist", collectionName))
+		return
+	}
+
+	volumeLayouts := collection.GetAllVolumeLayouts()
+
+	if detail {
+		//prepare the json response
+		all_stats := make([]map[string]interface{}, len(volumeLayouts))
+		for i, volumeLayout := range volumeLayouts {
+			volumeLayoutStats := volumeLayout.Stats()
+			m := make(map[string]interface{})
+			m["Version"] = util.Version()
+			m["Collection"] = collectionName
+			m["TotalSize"] = volumeLayoutStats.TotalSize
+			m["FileCount"] = volumeLayoutStats.FileCount
+			m["UsedSize"] = volumeLayoutStats.UsedSize
+			all_stats[i] = m
+		}
+		//write it
+		writeJsonQuiet(w, r, http.StatusOK, all_stats)
+	} else {
+		//prepare the json response
+		collectionStats := map[string]interface{}{
+			"Version":     util.Version(),
+			"Collection":  collectionName,
+			"TotalSize":   uint64(0),
+			"FileCount":   uint64(0),
+			"UsedSize":    uint64(0),
+			"VolumeCount": uint64(0),
+		}
+		for _, volumeLayout := range volumeLayouts {
+			volumeLayoutStats := volumeLayout.Stats()
+			collectionStats["TotalSize"] = collectionStats["TotalSize"].(uint64) + volumeLayoutStats.TotalSize
+			collectionStats["FileCount"] = collectionStats["FileCount"].(uint64) + volumeLayoutStats.FileCount
+			collectionStats["UsedSize"] = collectionStats["UsedSize"].(uint64) + volumeLayoutStats.UsedSize
+			collectionStats["VolumeCount"] = collectionStats["VolumeCount"].(uint64) + 1
+		}
+		//write it
+		writeJsonQuiet(w, r, http.StatusOK, collectionStats)
+	}
 }

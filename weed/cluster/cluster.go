@@ -1,264 +1,151 @@
 package cluster
 
 import (
-	"github.com/chrislusf/seaweedfs/weed/pb"
-	"github.com/chrislusf/seaweedfs/weed/pb/master_pb"
-	"math"
+	"github.com/seaweedfs/seaweedfs/weed/pb"
+	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
 	"sync"
 	"time"
 )
 
 const (
-	MasterType = "master"
-	FilerType  = "filer"
-	BrokerType = "broker"
+	MasterType       = "master"
+	VolumeServerType = "volumeServer"
+	FilerType        = "filer"
+	BrokerType       = "broker"
 )
 
+type FilerGroupName string
+type DataCenter string
+type Rack string
+
 type ClusterNode struct {
-	Address   pb.ServerAddress
-	Version   string
-	counter   int
-	createdTs time.Time
+	Address    pb.ServerAddress
+	Version    string
+	counter    int
+	CreatedTs  time.Time
+	DataCenter DataCenter
+	Rack       Rack
 }
 
-type Leaders struct {
-	leaders [3]pb.ServerAddress
+type ClusterNodeGroups struct {
+	groupMembers map[FilerGroupName]*GroupMembers
+	sync.RWMutex
 }
-
 type Cluster struct {
-	filers       map[pb.ServerAddress]*ClusterNode
-	filersLock   sync.RWMutex
-	filerLeaders *Leaders
-	brokers      map[pb.ServerAddress]*ClusterNode
-	brokersLock  sync.RWMutex
+	filerGroups  *ClusterNodeGroups
+	brokerGroups *ClusterNodeGroups
+}
+
+func newClusterNodeGroups() *ClusterNodeGroups {
+	return &ClusterNodeGroups{
+		groupMembers: map[FilerGroupName]*GroupMembers{},
+	}
+}
+func (g *ClusterNodeGroups) getGroupMembers(filerGroup FilerGroupName, createIfNotFound bool) *GroupMembers {
+	members, found := g.groupMembers[filerGroup]
+	if !found && createIfNotFound {
+		members = newGroupMembers()
+		g.groupMembers[filerGroup] = members
+	}
+	return members
+}
+
+func (g *ClusterNodeGroups) AddClusterNode(filerGroup FilerGroupName, nodeType string, dataCenter DataCenter, rack Rack, address pb.ServerAddress, version string) []*master_pb.KeepConnectedResponse {
+	g.Lock()
+	defer g.Unlock()
+	m := g.getGroupMembers(filerGroup, true)
+	if t := m.addMember(dataCenter, rack, address, version); t != nil {
+		return buildClusterNodeUpdateMessage(true, filerGroup, nodeType, address)
+	}
+	return nil
+}
+func (g *ClusterNodeGroups) RemoveClusterNode(filerGroup FilerGroupName, nodeType string, address pb.ServerAddress) []*master_pb.KeepConnectedResponse {
+	g.Lock()
+	defer g.Unlock()
+	m := g.getGroupMembers(filerGroup, false)
+	if m == nil {
+		return nil
+	}
+	if m.removeMember(address) {
+		return buildClusterNodeUpdateMessage(false, filerGroup, nodeType, address)
+	}
+	return nil
+}
+func (g *ClusterNodeGroups) ListClusterNode(filerGroup FilerGroupName) (nodes []*ClusterNode) {
+	g.Lock()
+	defer g.Unlock()
+	m := g.getGroupMembers(filerGroup, false)
+	if m == nil {
+		return nil
+	}
+	for _, node := range m.members {
+		nodes = append(nodes, node)
+	}
+	return
 }
 
 func NewCluster() *Cluster {
 	return &Cluster{
-		filers:       make(map[pb.ServerAddress]*ClusterNode),
-		filerLeaders: &Leaders{},
-		brokers:      make(map[pb.ServerAddress]*ClusterNode),
+		filerGroups:  newClusterNodeGroups(),
+		brokerGroups: newClusterNodeGroups(),
 	}
 }
 
-func (cluster *Cluster) AddClusterNode(nodeType string, address pb.ServerAddress, version string) []*master_pb.KeepConnectedResponse {
+func (cluster *Cluster) getGroupMembers(filerGroup FilerGroupName, nodeType string, createIfNotFound bool) *GroupMembers {
 	switch nodeType {
 	case FilerType:
-		cluster.filersLock.Lock()
-		defer cluster.filersLock.Unlock()
-		if existingNode, found := cluster.filers[address]; found {
-			existingNode.counter++
-			return nil
-		}
-		cluster.filers[address] = &ClusterNode{
-			Address:   address,
-			Version:   version,
-			counter:   1,
-			createdTs: time.Now(),
-		}
-		return cluster.ensureFilerLeaders(true, nodeType, address)
+		return cluster.filerGroups.getGroupMembers(filerGroup, createIfNotFound)
 	case BrokerType:
-		cluster.brokersLock.Lock()
-		defer cluster.brokersLock.Unlock()
-		if existingNode, found := cluster.brokers[address]; found {
-			existingNode.counter++
-			return nil
-		}
-		cluster.brokers[address] = &ClusterNode{
-			Address:   address,
-			Version:   version,
-			counter:   1,
-			createdTs: time.Now(),
-		}
-		return []*master_pb.KeepConnectedResponse{
-			{
-				ClusterNodeUpdate: &master_pb.ClusterNodeUpdate{
-					NodeType: nodeType,
-					Address:  string(address),
-					IsAdd:    true,
-				},
-			},
-		}
-	case MasterType:
+		return cluster.brokerGroups.getGroupMembers(filerGroup, createIfNotFound)
 	}
 	return nil
 }
 
-func (cluster *Cluster) RemoveClusterNode(nodeType string, address pb.ServerAddress) []*master_pb.KeepConnectedResponse {
+func (cluster *Cluster) AddClusterNode(ns, nodeType string, dataCenter DataCenter, rack Rack, address pb.ServerAddress, version string) []*master_pb.KeepConnectedResponse {
+	filerGroup := FilerGroupName(ns)
 	switch nodeType {
 	case FilerType:
-		cluster.filersLock.Lock()
-		defer cluster.filersLock.Unlock()
-		if existingNode, found := cluster.filers[address]; !found {
-			return nil
-		} else {
-			existingNode.counter--
-			if existingNode.counter <= 0 {
-				delete(cluster.filers, address)
-				return cluster.ensureFilerLeaders(false, nodeType, address)
-			}
-		}
+		return cluster.filerGroups.AddClusterNode(filerGroup, nodeType, dataCenter, rack, address, version)
 	case BrokerType:
-		cluster.brokersLock.Lock()
-		defer cluster.brokersLock.Unlock()
-		if existingNode, found := cluster.brokers[address]; !found {
-			return nil
-		} else {
-			existingNode.counter--
-			if existingNode.counter <= 0 {
-				delete(cluster.brokers, address)
-				return []*master_pb.KeepConnectedResponse{
-					{
-						ClusterNodeUpdate: &master_pb.ClusterNodeUpdate{
-							NodeType: nodeType,
-							Address:  string(address),
-							IsAdd:    false,
-						},
-					},
-				}
-			}
-		}
+		return cluster.brokerGroups.AddClusterNode(filerGroup, nodeType, dataCenter, rack, address, version)
 	case MasterType:
+		return buildClusterNodeUpdateMessage(true, filerGroup, nodeType, address)
 	}
 	return nil
 }
 
-func (cluster *Cluster) ListClusterNode(nodeType string) (nodes []*ClusterNode) {
+func (cluster *Cluster) RemoveClusterNode(ns string, nodeType string, address pb.ServerAddress) []*master_pb.KeepConnectedResponse {
+	filerGroup := FilerGroupName(ns)
 	switch nodeType {
 	case FilerType:
-		cluster.filersLock.RLock()
-		defer cluster.filersLock.RUnlock()
-		for _, node := range cluster.filers {
-			nodes = append(nodes, node)
-		}
+		return cluster.filerGroups.RemoveClusterNode(filerGroup, nodeType, address)
 	case BrokerType:
-		cluster.brokersLock.RLock()
-		defer cluster.brokersLock.RUnlock()
-		for _, node := range cluster.brokers {
-			nodes = append(nodes, node)
-		}
+		return cluster.brokerGroups.RemoveClusterNode(filerGroup, nodeType, address)
+	case MasterType:
+		return buildClusterNodeUpdateMessage(false, filerGroup, nodeType, address)
+	}
+	return nil
+}
+
+func (cluster *Cluster) ListClusterNode(filerGroup FilerGroupName, nodeType string) (nodes []*ClusterNode) {
+	switch nodeType {
+	case FilerType:
+		return cluster.filerGroups.ListClusterNode(filerGroup)
+	case BrokerType:
+		return cluster.brokerGroups.ListClusterNode(filerGroup)
 	case MasterType:
 	}
 	return
 }
 
-func (cluster *Cluster) IsOneLeader(address pb.ServerAddress) bool {
-	return cluster.filerLeaders.isOneLeader(address)
-}
-
-func (cluster *Cluster) ensureFilerLeaders(isAdd bool, nodeType string, address pb.ServerAddress) (result []*master_pb.KeepConnectedResponse) {
-	if isAdd {
-		if cluster.filerLeaders.addLeaderIfVacant(address) {
-			// has added the address as one leader
-			result = append(result, &master_pb.KeepConnectedResponse{
-				ClusterNodeUpdate: &master_pb.ClusterNodeUpdate{
-					NodeType: nodeType,
-					Address:  string(address),
-					IsLeader: true,
-					IsAdd:    true,
-				},
-			})
-		} else {
-			result = append(result, &master_pb.KeepConnectedResponse{
-				ClusterNodeUpdate: &master_pb.ClusterNodeUpdate{
-					NodeType: nodeType,
-					Address:  string(address),
-					IsLeader: false,
-					IsAdd:    true,
-				},
-			})
-		}
-	} else {
-		if cluster.filerLeaders.removeLeaderIfExists(address) {
-
-			result = append(result, &master_pb.KeepConnectedResponse{
-				ClusterNodeUpdate: &master_pb.ClusterNodeUpdate{
-					NodeType: nodeType,
-					Address:  string(address),
-					IsLeader: true,
-					IsAdd:    false,
-				},
-			})
-
-			// pick the freshest one, since it is less likely to go away
-			var shortestDuration int64 = math.MaxInt64
-			now := time.Now()
-			var candidateAddress pb.ServerAddress
-			for _, node := range cluster.filers {
-				if cluster.filerLeaders.isOneLeader(node.Address) {
-					continue
-				}
-				duration := now.Sub(node.createdTs).Nanoseconds()
-				if duration < shortestDuration {
-					shortestDuration = duration
-					candidateAddress = node.Address
-				}
-			}
-			if candidateAddress != "" {
-				cluster.filerLeaders.addLeaderIfVacant(candidateAddress)
-				// added a new leader
-				result = append(result, &master_pb.KeepConnectedResponse{
-					ClusterNodeUpdate: &master_pb.ClusterNodeUpdate{
-						NodeType: nodeType,
-						Address:  string(candidateAddress),
-						IsLeader: true,
-						IsAdd:    true,
-					},
-				})
-			}
-		} else {
-			result = append(result, &master_pb.KeepConnectedResponse{
-				ClusterNodeUpdate: &master_pb.ClusterNodeUpdate{
-					NodeType: nodeType,
-					Address:  string(address),
-					IsLeader: false,
-					IsAdd:    false,
-				},
-			})
-		}
-	}
-	return
-}
-
-func (leaders *Leaders) addLeaderIfVacant(address pb.ServerAddress) (hasChanged bool) {
-	if leaders.isOneLeader(address) {
-		return
-	}
-	for i := 0; i < len(leaders.leaders); i++ {
-		if leaders.leaders[i] == "" {
-			leaders.leaders[i] = address
-			hasChanged = true
-			return
-		}
-	}
-	return
-}
-func (leaders *Leaders) removeLeaderIfExists(address pb.ServerAddress) (hasChanged bool) {
-	if !leaders.isOneLeader(address) {
-		return
-	}
-	for i := 0; i < len(leaders.leaders); i++ {
-		if leaders.leaders[i] == address {
-			leaders.leaders[i] = ""
-			hasChanged = true
-			return
-		}
-	}
-	return
-}
-func (leaders *Leaders) isOneLeader(address pb.ServerAddress) bool {
-	for i := 0; i < len(leaders.leaders); i++ {
-		if leaders.leaders[i] == address {
-			return true
-		}
-	}
-	return false
-}
-func (leaders *Leaders) GetLeaders() (addresses []pb.ServerAddress) {
-	for i := 0; i < len(leaders.leaders); i++ {
-		if leaders.leaders[i] != "" {
-			addresses = append(addresses, leaders.leaders[i])
-		}
-	}
+func buildClusterNodeUpdateMessage(isAdd bool, filerGroup FilerGroupName, nodeType string, address pb.ServerAddress) (result []*master_pb.KeepConnectedResponse) {
+	result = append(result, &master_pb.KeepConnectedResponse{
+		ClusterNodeUpdate: &master_pb.ClusterNodeUpdate{
+			FilerGroup: string(filerGroup),
+			NodeType:   nodeType,
+			Address:    string(address),
+			IsAdd:      isAdd,
+		},
+	})
 	return
 }

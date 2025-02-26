@@ -3,7 +3,8 @@ package s3api
 import (
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/s3"
-	"github.com/chrislusf/seaweedfs/weed/s3api/s3err"
+	"github.com/seaweedfs/seaweedfs/weed/s3api/s3err"
+	"github.com/stretchr/testify/assert"
 	"testing"
 	"time"
 )
@@ -47,4 +48,29 @@ func TestListPartsResult(t *testing.T) {
 		t.Errorf("unexpected output: %s\nexpecting:%s", encoded, expected)
 	}
 
+}
+
+func Test_parsePartNumber(t *testing.T) {
+	tests := []struct {
+		name     string
+		fileName string
+		partNum  int
+	}{
+		{
+			"first",
+			"0001_uuid.part",
+			1,
+		},
+		{
+			"second",
+			"0002.part",
+			2,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			partNumber, _ := parsePartNumber(tt.fileName)
+			assert.Equalf(t, tt.partNum, partNumber, "parsePartNumber(%v)", tt.fileName)
+		})
+	}
 }
